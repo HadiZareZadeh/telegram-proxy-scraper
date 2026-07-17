@@ -252,6 +252,8 @@ async def ping_v2ray_servers(
     test_bytes: int = DEFAULT_TEST_BYTES,
     xray_bin: str | None = None,
     on_result=None,
+    max_working: int | None = None,
+    initial_working_keys: set[str] | None = None,
 ) -> list[V2RayPingResult]:
     if not servers:
         return []
@@ -259,12 +261,27 @@ async def ping_v2ray_servers(
     sem = asyncio.Semaphore(concurrency)
     results: list[V2RayPingResult] = []
     lock = asyncio.Lock()
+    working_keys: set[str] = set(initial_working_keys or ())
     done = 0
     total = len(servers)
 
     async def _one(server: V2RayServer) -> None:
         nonlocal done
+        async with lock:
+            if (
+                max_working is not None
+                and len(working_keys) >= max_working
+                and server.key not in working_keys
+            ):
+                return
         async with sem:
+            async with lock:
+                if (
+                    max_working is not None
+                    and len(working_keys) >= max_working
+                    and server.key not in working_keys
+                ):
+                    return
             result = await ping_v2ray(
                 server,
                 timeout=timeout,
@@ -274,6 +291,10 @@ async def ping_v2ray_servers(
             )
         async with lock:
             done += 1
+            if result.ok and result.latency is not None:
+                working_keys.add(server.key)
+            else:
+                working_keys.discard(server.key)
             results.append(result)
             if on_result:
                 on_result(done, total, result)
@@ -299,16 +320,20 @@ async def check_and_reorganize_v2ray(
     xray_bin: str | None = None,
     on_result=None,
     respect_backoff: bool = True,
-    limit: int | None = None,
 ) -> V2RayReorganizeStats:
     if hasattr(catalog, "probe_queue"):
-        servers = catalog.probe_queue(
-            respect_backoff=respect_backoff, limit=limit
-        )
+        servers = catalog.probe_queue(respect_backoff=respect_backoff)
     else:
         servers = catalog.all_unique()
     if not servers:
         return V2RayReorganizeStats(0, 0, None)
+
+    max_working = catalog.max_working
+    initial_working_keys = None
+    if max_working is not None:
+        initial_working_keys = {
+            s.key for view in catalog.working.values() for s in view.all()
+        }
 
     results = await ping_v2ray_servers(
         servers,
@@ -318,6 +343,8 @@ async def check_and_reorganize_v2ray(
         test_bytes=test_bytes,
         xray_bin=xray_bin,
         on_result=on_result,
+        max_working=max_working,
+        initial_working_keys=initial_working_keys,
     )
 
     if hasattr(catalog, "apply_ping_results"):

@@ -22,17 +22,16 @@ def _print_fastest(fastest) -> None:
     print(f"  endpoint: {server.scheme}://{server.host}:{server.port}")
 
 
-def _probe_kwargs(catalog, config) -> dict:
+def _probe_kwargs(config) -> dict:
     return {
         "respect_backoff": bool(getattr(config, "PROBE_RESPECT_BACKOFF", True)),
-        "limit": catalog.max_working,
     }
 
 
 async def run(config, best: list) -> None:
     db, _mt, catalog = open_catalogs(config)
     try:
-        probe_kw = _probe_kwargs(catalog, config)
+        probe_kw = _probe_kwargs(config)
         queue = catalog.probe_queue(**probe_kw)
         working, failed = catalog.counts()
         total_unique = len(catalog.all_unique())

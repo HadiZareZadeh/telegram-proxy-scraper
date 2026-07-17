@@ -237,6 +237,8 @@ async def ping_proxies(
     concurrency: int = 20,
     timeout: float = 8.0,
     on_result=None,
+    max_working: int | None = None,
+    initial_working_keys: set[str] | None = None,
 ) -> list[PingResult]:
     if not proxies:
         return []
@@ -244,15 +246,34 @@ async def ping_proxies(
     sem = asyncio.Semaphore(concurrency)
     results: list[PingResult] = []
     lock = asyncio.Lock()
+    working_keys: set[str] = set(initial_working_keys or ())
     done = 0
     total = len(proxies)
 
     async def _one(proxy: MTProtoProxy) -> None:
         nonlocal done
+        async with lock:
+            if (
+                max_working is not None
+                and len(working_keys) >= max_working
+                and proxy.key not in working_keys
+            ):
+                return
         async with sem:
+            async with lock:
+                if (
+                    max_working is not None
+                    and len(working_keys) >= max_working
+                    and proxy.key not in working_keys
+                ):
+                    return
             result = await ping_proxy(proxy, timeout)
         async with lock:
             done += 1
+            if result.ok and result.latency is not None:
+                working_keys.add(proxy.key)
+            else:
+                working_keys.discard(proxy.key)
             results.append(result)
             if on_result:
                 on_result(done, total, result)
@@ -313,23 +334,27 @@ async def check_and_reorganize(
     timeout: float = 8.0,
     on_result=None,
     respect_backoff: bool = True,
-    limit: int | None = None,
 ) -> ReorganizeStats:
     """Ping the adaptive probe queue and update health stats + working/failed."""
     if hasattr(catalog, "probe_queue"):
-        proxies = catalog.probe_queue(
-            respect_backoff=respect_backoff, limit=limit
-        )
+        proxies = catalog.probe_queue(respect_backoff=respect_backoff)
     else:
         proxies = catalog.all_unique()
     if not proxies:
         return ReorganizeStats(0, 0, None)
+
+    max_working = getattr(catalog, "max_working", None)
+    initial_working_keys = None
+    if max_working is not None and hasattr(catalog, "working"):
+        initial_working_keys = {p.key for p in catalog.working.all()}
 
     results = await ping_proxies(
         proxies,
         concurrency=concurrency,
         timeout=timeout,
         on_result=on_result,
+        max_working=max_working,
+        initial_working_keys=initial_working_keys,
     )
 
     if hasattr(catalog, "apply_ping_results"):

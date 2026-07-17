@@ -114,8 +114,8 @@ async def periodic_checks(
         timeout = getattr(config, "PING_TIMEOUT", 8.0)
         v2_kwargs = v2ray_test_kwargs(config)
         respect_backoff = bool(getattr(config, "PROBE_RESPECT_BACKOFF", True))
-        mt_probe_kw = {"respect_backoff": respect_backoff, "limit": mt_catalog.max_working}
-        v2_probe_kw = {"respect_backoff": respect_backoff, "limit": v2_catalog.max_working}
+        mt_probe_kw = {"respect_backoff": respect_backoff}
+        v2_probe_kw = {"respect_backoff": respect_backoff}
 
         def _mt_progress(done: int, total_n: int, result) -> None:
             if result.ok and result.latency is not None:
