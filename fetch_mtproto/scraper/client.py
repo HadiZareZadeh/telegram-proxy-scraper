@@ -41,7 +41,7 @@ def make_client(
     session: str,
     proxy: MTProtoProxy | None = None,
     *,
-    connection_retries: int = 5,
+    connection_retries: int = 2,
 ) -> TelegramClient:
     kwargs: dict = {
         "session": _session_path(session),

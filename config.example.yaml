@@ -12,6 +12,7 @@ telegram:
     - "@Gp_config"
     - "@meliproxyy"
     - "@PinkProxy"
+    - "@NT_Safe"
   # How many recent messages to scan per source (null = all history; can be slow)
   messages_per_source: 500
 
