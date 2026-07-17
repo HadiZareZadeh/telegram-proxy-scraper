@@ -6,6 +6,8 @@ import asyncio
 import os
 import shutil
 import socket
+import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -200,6 +202,10 @@ async def ping_v2ray(
             handle.write(dumps_config(config))
             cfg_path = handle.name
 
+        proc_kw: dict = {}
+        if sys.platform == "win32":
+            proc_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
         proc = await asyncio.create_subprocess_exec(
             bin_path,
             "run",
@@ -207,6 +213,7 @@ async def ping_v2ray(
             cfg_path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            **proc_kw,
         )
         await _wait_port("127.0.0.1", socks_port, timeout=min(8.0, timeout))
         latency, nbytes = await _ping_via_socks(
