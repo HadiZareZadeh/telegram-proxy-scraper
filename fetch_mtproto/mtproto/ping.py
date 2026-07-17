@@ -239,6 +239,7 @@ async def ping_proxies(
     on_result=None,
     max_working: int | None = None,
     initial_working_keys: set[str] | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> list[PingResult]:
     if not proxies:
         return []
@@ -252,7 +253,11 @@ async def ping_proxies(
 
     async def _one(proxy: MTProtoProxy) -> None:
         nonlocal done
+        if cancel_event and cancel_event.is_set():
+            return
         async with lock:
+            if cancel_event and cancel_event.is_set():
+                return
             if (
                 max_working is not None
                 and len(working_keys) >= max_working
@@ -261,6 +266,8 @@ async def ping_proxies(
                 return
         async with sem:
             async with lock:
+                if cancel_event and cancel_event.is_set():
+                    return
                 if (
                     max_working is not None
                     and len(working_keys) >= max_working
@@ -325,6 +332,9 @@ class ReorganizeStats:
     ok: int
     failed: int
     fastest: tuple[MTProtoProxy, float] | None
+    checked: int = 0
+    total: int = 0
+    cancelled: bool = False
 
 
 async def check_and_reorganize(
@@ -334,6 +344,7 @@ async def check_and_reorganize(
     timeout: float = 8.0,
     on_result=None,
     respect_backoff: bool = True,
+    cancel_event: asyncio.Event | None = None,
 ) -> ReorganizeStats:
     """Ping the adaptive probe queue and update health stats + working/failed."""
     if hasattr(catalog, "probe_queue"):
@@ -343,6 +354,7 @@ async def check_and_reorganize(
     if not proxies:
         return ReorganizeStats(0, 0, None)
 
+    total = len(proxies)
     max_working = getattr(catalog, "max_working", None)
     initial_working_keys = None
     if max_working is not None and hasattr(catalog, "working"):
@@ -355,10 +367,14 @@ async def check_and_reorganize(
         on_result=on_result,
         max_working=max_working,
         initial_working_keys=initial_working_keys,
+        cancel_event=cancel_event,
     )
+    cancelled = bool(cancel_event and cancel_event.is_set())
+    checked = len(results)
 
     if hasattr(catalog, "apply_ping_results"):
-        catalog.apply_ping_results(results)
+        if results:
+            catalog.apply_ping_results(results)
         ok_ranked = [
             (r.proxy, r.latency)
             for r in results
@@ -367,7 +383,14 @@ async def check_and_reorganize(
         ok_ranked.sort(key=lambda item: item[1])
         failed_n = sum(1 for r in results if not r.ok or r.latency is None)
         fastest = (ok_ranked[0][0], ok_ranked[0][1]) if ok_ranked else None
-        return ReorganizeStats(len(ok_ranked), failed_n, fastest)
+        return ReorganizeStats(
+            len(ok_ranked),
+            failed_n,
+            fastest,
+            checked=checked,
+            total=total,
+            cancelled=cancelled,
+        )
 
     ok_ranked = []
     failed = []
@@ -378,9 +401,17 @@ async def check_and_reorganize(
             failed.append(result.proxy)
     ok_ranked.sort(key=lambda item: item[1])
     ok = [proxy for proxy, _ in ok_ranked]
-    catalog.reorganize(ok, failed)
+    if results:
+        catalog.reorganize(ok, failed)
     fastest = (ok_ranked[0][0], ok_ranked[0][1]) if ok_ranked else None
-    return ReorganizeStats(len(ok), len(failed), fastest)
+    return ReorganizeStats(
+        len(ok),
+        len(failed),
+        fastest,
+        checked=checked,
+        total=total,
+        cancelled=cancelled,
+    )
 
 
 def patch_telethon_faketls() -> None:

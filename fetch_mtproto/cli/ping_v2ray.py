@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
+from fetch_mtproto.cancel import CancelScope
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import load_config
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
@@ -26,6 +27,24 @@ def _probe_kwargs(config) -> dict:
     return {
         "respect_backoff": bool(getattr(config, "PROBE_RESPECT_BACKOFF", True)),
     }
+
+
+def _print_run_summary(stats, summary) -> None:
+    print()
+    if stats.cancelled:
+        print(
+            f"Stopped early after {stats.checked}/{stats.total} servers "
+            f"— saved {stats.checked} result(s)."
+        )
+    print(
+        f"This run: {stats.ok} ok / {stats.failed} fail · "
+        f"catalog working={summary['working']} failed={summary['failed']} · "
+        f"lifetime successes={summary['successes']} failures={summary['failures']}"
+    )
+    if summary["avg_ok_ms"]:
+        print(f"Avg working latency: {summary['avg_ok_ms']:.0f} ms")
+    print()
+    _print_fastest(stats.fastest)
 
 
 async def run(config, best: list) -> None:
@@ -68,24 +87,17 @@ async def run(config, best: list) -> None:
                 err = f" ({result.error})" if result.error else ""
                 print(f"[{done}/{total}] FAIL{err}  {label}")
 
-        stats = await check_and_reorganize_v2ray(
-            catalog,
-            on_result=on_result,
-            **kwargs,
-            **probe_kw,
-        )
+        async with CancelScope() as cancel_event:
+            stats = await check_and_reorganize_v2ray(
+                catalog,
+                on_result=on_result,
+                cancel_event=cancel_event,
+                **kwargs,
+                **probe_kw,
+            )
         best[0] = stats.fastest
         summary = db.v2ray_health_summary()
-        print()
-        print(
-            f"This run: {stats.ok} ok / {stats.failed} fail · "
-            f"catalog working={summary['working']} failed={summary['failed']} · "
-            f"lifetime successes={summary['successes']} failures={summary['failures']}"
-        )
-        if summary["avg_ok_ms"]:
-            print(f"Avg working latency: {summary['avg_ok_ms']:.0f} ms")
-        print()
-        _print_fastest(stats.fastest)
+        _print_run_summary(stats, summary)
     finally:
         db.close()
 

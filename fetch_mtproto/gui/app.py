@@ -10,8 +10,10 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
+from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from fetch_mtproto.cancel import CANCEL_ENV
 from fetch_mtproto.paths import LOGS_DIR, PROJECT_ROOT
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_process_tree
 
@@ -27,7 +29,9 @@ class Job:
     name: str
     args: list[str]
     long_running: bool = False
+    stoppable: bool = False
     process: subprocess.Popen | None = field(default=None, repr=False)
+    cancel_file: Path | None = field(default=None, repr=False)
 
     @property
     def running(self) -> bool:
@@ -45,11 +49,13 @@ class App:
             "label": "Ping MTProto",
             "module": "fetch_mtproto.cli.ping_mtproto",
             "long_running": False,
+            "stoppable": True,
         },
         "ping_v2ray": {
             "label": "Ping V2Ray",
             "module": "fetch_mtproto.cli.ping_v2ray",
             "long_running": False,
+            "stoppable": True,
         },
         "serve": {
             "label": "Subscription server",
@@ -412,11 +418,21 @@ class App:
 
     # ---------------------------------------------------------------- jobs
 
+    @staticmethod
+    def _job_button_start_text(spec: dict) -> str:
+        if spec["long_running"]:
+            return f"Start {spec['label']}"
+        return spec["label"]
+
+    @staticmethod
+    def _job_button_stop_text(spec: dict) -> str:
+        return f"Stop {spec['label']}"
+
     def toggle_job(self, key: str) -> None:
         spec = self.JOBS[key]
         job = self.jobs.get(key)
         if job is not None and job.running:
-            if spec["long_running"]:
+            if spec["long_running"] or spec.get("stoppable"):
                 self.stop_job(key)
             else:
                 self.log_line(f"[{spec['label']}] already running…")
@@ -444,6 +460,12 @@ class App:
         child_env = dict(os.environ)
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"] = "1"
+        cancel_file: Path | None = None
+        if spec.get("stoppable"):
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            cancel_file = LOGS_DIR / f".cancel-{key}.flag"
+            cancel_file.unlink(missing_ok=True)
+            child_env[CANCEL_ENV] = str(cancel_file)
         popen_kw: dict = {
             "cwd": str(PROJECT_ROOT),
             "stdin": subprocess.PIPE,
@@ -468,13 +490,15 @@ class App:
             name=key,
             args=args,
             long_running=spec["long_running"],
+            stoppable=bool(spec.get("stoppable")),
             process=process,
+            cancel_file=cancel_file,
         )
         self.jobs[key] = job
         self.active_stdin = key
         self.log_line(f"[{spec['label']}] started (pid {process.pid})")
-        if spec["long_running"]:
-            self.buttons[key].configure(text=f"Stop {spec['label']}")
+        if spec["long_running"] or spec.get("stoppable"):
+            self.buttons[key].configure(text=self._job_button_stop_text(spec))
 
         threading.Thread(
             target=self._pump_output, args=(key,), daemon=True
@@ -506,10 +530,16 @@ class App:
 
     def _job_finished(self, key: str) -> None:
         spec = self.JOBS[key]
+        job = self.jobs.get(key)
+        if job is not None and job.cancel_file is not None:
+            try:
+                job.cancel_file.unlink(missing_ok=True)
+            except OSError:
+                pass
         if key == "serve":
             self._hide_subscription_panel()
-        if spec["long_running"]:
-            self.buttons[key].configure(text=f"Start {spec['label']}")
+        if spec["long_running"] or spec.get("stoppable"):
+            self.buttons[key].configure(text=self._job_button_start_text(spec))
         if self.active_stdin == key:
             self.active_stdin = None
         self.refresh_status()
@@ -521,8 +551,23 @@ class App:
         spec = self.JOBS[key]
         if key == "serve":
             self._hide_subscription_panel()
-        self.log_line(f"[{spec['label']}] stopping…")
         assert job.process is not None
+        if spec.get("stoppable") and job.cancel_file is not None:
+            self.log_line(f"[{spec['label']}] stopping (saving checked servers)…")
+            try:
+                job.cancel_file.parent.mkdir(parents=True, exist_ok=True)
+                job.cancel_file.write_text("1", encoding="utf-8")
+            except OSError as exc:
+                self.log_line(f"[{spec['label']}] cancel flag failed: {exc}")
+            deadline = time.monotonic() + 30.0
+            while time.monotonic() < deadline:
+                if job.process.poll() is not None:
+                    return
+                time.sleep(0.2)
+            self.log_line(f"[{spec['label']}] force stopping…")
+            kill_process_tree(job.process)
+            return
+        self.log_line(f"[{spec['label']}] stopping…")
         kill_process_tree(job.process)
 
     def send_stdin(self) -> None:

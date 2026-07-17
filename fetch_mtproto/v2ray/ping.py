@@ -256,6 +256,7 @@ async def ping_v2ray_servers(
     on_result=None,
     max_working: int | None = None,
     initial_working_keys: set[str] | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> list[V2RayPingResult]:
     if not servers:
         return []
@@ -269,7 +270,11 @@ async def ping_v2ray_servers(
 
     async def _one(server: V2RayServer) -> None:
         nonlocal done
+        if cancel_event and cancel_event.is_set():
+            return
         async with lock:
+            if cancel_event and cancel_event.is_set():
+                return
             if (
                 max_working is not None
                 and len(working_keys) >= max_working
@@ -278,6 +283,8 @@ async def ping_v2ray_servers(
                 return
         async with sem:
             async with lock:
+                if cancel_event and cancel_event.is_set():
+                    return
                 if (
                     max_working is not None
                     and len(working_keys) >= max_working
@@ -310,6 +317,9 @@ class V2RayReorganizeStats:
     ok: int
     failed: int
     fastest: tuple[V2RayServer, float] | None
+    checked: int = 0
+    total: int = 0
+    cancelled: bool = False
 
 
 async def check_and_reorganize_v2ray(
@@ -322,6 +332,7 @@ async def check_and_reorganize_v2ray(
     xray_bin: str | None = None,
     on_result=None,
     respect_backoff: bool = True,
+    cancel_event: asyncio.Event | None = None,
 ) -> V2RayReorganizeStats:
     if hasattr(catalog, "probe_queue"):
         servers = catalog.probe_queue(respect_backoff=respect_backoff)
@@ -330,6 +341,7 @@ async def check_and_reorganize_v2ray(
     if not servers:
         return V2RayReorganizeStats(0, 0, None)
 
+    total = len(servers)
     max_working = catalog.max_working
     initial_working_keys = None
     if max_working is not None:
@@ -347,10 +359,14 @@ async def check_and_reorganize_v2ray(
         on_result=on_result,
         max_working=max_working,
         initial_working_keys=initial_working_keys,
+        cancel_event=cancel_event,
     )
+    cancelled = bool(cancel_event and cancel_event.is_set())
+    checked = len(results)
 
     if hasattr(catalog, "apply_ping_results"):
-        catalog.apply_ping_results(results)
+        if results:
+            catalog.apply_ping_results(results)
         ok_ranked = [
             (r.server, r.latency)
             for r in results
@@ -359,7 +375,14 @@ async def check_and_reorganize_v2ray(
         ok_ranked.sort(key=lambda item: item[1])
         failed_n = sum(1 for r in results if not r.ok or r.latency is None)
         fastest = (ok_ranked[0][0], ok_ranked[0][1]) if ok_ranked else None
-        return V2RayReorganizeStats(len(ok_ranked), failed_n, fastest)
+        return V2RayReorganizeStats(
+            len(ok_ranked),
+            failed_n,
+            fastest,
+            checked=checked,
+            total=total,
+            cancelled=cancelled,
+        )
 
     ok_ranked = []
     failed = []
@@ -370,6 +393,14 @@ async def check_and_reorganize_v2ray(
             failed.append(result.server)
     ok_ranked.sort(key=lambda item: item[1])
     ok = [server for server, _ in ok_ranked]
-    catalog.reorganize(ok, failed)
+    if results:
+        catalog.reorganize(ok, failed)
     fastest = (ok_ranked[0][0], ok_ranked[0][1]) if ok_ranked else None
-    return V2RayReorganizeStats(len(ok), len(failed), fastest)
+    return V2RayReorganizeStats(
+        len(ok),
+        len(failed),
+        fastest,
+        checked=checked,
+        total=total,
+        cancelled=cancelled,
+    )
