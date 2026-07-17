@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fetch-mtproto Linux setup: Python venv, deps, Xray-core, config, data dirs.
+# fetch-mtproto Linux setup: Python deps, Xray-core, config, data dirs.
 set -o pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,7 +7,6 @@ cd "$ROOT"
 
 ERR=0
 PYTHON=""
-VENV_PY="$ROOT/.venv/bin/python"
 REQUIREMENTS="$ROOT/requirements.txt"
 XRAY_DIR="$ROOT/xray"
 XRAY_BIN="$ROOT/xray/xray"
@@ -54,7 +53,7 @@ find_python() {
 }
 
 deps_satisfied() {
-  [[ -x "$VENV_PY" ]] && "$VENV_PY" -c "import telethon, python_socks, TelethonFakeTLS, cryptography" 2>/dev/null
+  [[ -n "$PYTHON" ]] && "$PYTHON" -c "import telethon, python_socks, TelethonFakeTLS, cryptography" 2>/dev/null
 }
 
 find_xray_on_path() {
@@ -74,7 +73,7 @@ find_xray_on_path() {
 
 python_install_hint() {
   echo "  Install Python 3.10+ using your package manager, for example:"
-  echo "    Debian/Ubuntu: sudo apt install python3 python3-venv python3-pip python3-tk"
+  echo "    Debian/Ubuntu: sudo apt install python3 python3-pip python3-tk"
   echo "    Fedora:          sudo dnf install python3 python3-pip python3-tkinter"
   echo "    Arch:            sudo pacman -S python python-pip tk"
 }
@@ -101,7 +100,7 @@ echo "Project: $ROOT"
 echo
 
 # ---------- 1) Python ----------
-echo "[1/6] Checking for installed Python 3.10+ ..."
+echo "[1/5] Checking for installed Python 3.10+ ..."
 if find_python; then
   ok "Using installed Python: $PYTHON"
 else
@@ -110,44 +109,25 @@ else
 fi
 echo
 
-# ---------- 2) Virtual environment ----------
-echo "[2/6] Creating virtual environment (.venv) ..."
-if [[ -x "$VENV_PY" ]]; then
-  ok "Existing .venv found"
-else
-  if [[ "$ERR" -ne 0 ]]; then
-    :
-  elif ! "$PYTHON" -m venv "$ROOT/.venv"; then
-    fail "Failed to create .venv (install python3-venv / python3.X-venv for your distro)"
-    python_install_hint
-  else
-    ok "Created .venv"
-  fi
-fi
-if [[ "$ERR" -eq 0 && ! -x "$VENV_PY" ]]; then
-  fail "venv python missing: $VENV_PY"
-fi
-echo
-
-# ---------- 3) Python packages ----------
-echo "[3/6] Installing Python packages ..."
+# ---------- 2) Python packages ----------
+echo "[2/5] Installing Python packages ..."
 if [[ "$ERR" -eq 0 && ! -f "$REQUIREMENTS" ]]; then
   fail "requirements.txt not found"
 elif [[ "$ERR" -eq 0 ]]; then
   if deps_satisfied; then
-    ok "Dependencies already installed in .venv"
-  elif ! "$VENV_PY" -m pip install --upgrade pip setuptools wheel; then
+    ok "Dependencies already installed globally"
+  elif ! "$PYTHON" -m pip install --upgrade pip setuptools wheel; then
     fail "pip upgrade failed"
-  elif ! "$VENV_PY" -m pip install -r "$REQUIREMENTS"; then
+  elif ! "$PYTHON" -m pip install -r "$REQUIREMENTS"; then
     fail "pip install -r requirements.txt failed"
   else
-    ok "Dependencies installed"
+    ok "Dependencies installed globally"
   fi
 fi
 echo
 
-# ---------- 4) Xray-core ----------
-echo "[4/6] Checking Xray-core ..."
+# ---------- 3) Xray-core ----------
+echo "[3/5] Checking Xray-core ..."
 if [[ "$ERR" -ne 0 ]]; then
   :
 elif XRAY_ON_PATH="$(find_xray_on_path)"; then
@@ -200,8 +180,8 @@ else
 fi
 echo
 
-# ---------- 5) Config ----------
-echo "[5/6] Checking config.yaml ..."
+# ---------- 4) Config ----------
+echo "[4/5] Checking config.yaml ..."
 if [[ "$ERR" -ne 0 ]]; then
   :
 elif [[ -f "$ROOT/config.yaml" ]]; then
@@ -217,15 +197,15 @@ else
 fi
 echo
 
-# ---------- 6) Data directories ----------
-echo "[6/6] Ensuring data folders ..."
+# ---------- 5) Data directories ----------
+echo "[5/5] Ensuring data folders ..."
 mkdir -p "$ROOT/data/mtproto" "$ROOT/data/v2ray" "$ROOT/sessions" "$ROOT/logs"
 ok "data, sessions, and logs folders ready (catalog.db is created on first run)"
 echo
 
 # Optional GUI dependency check
-if [[ "$ERR" -eq 0 && -x "$VENV_PY" ]]; then
-  if ! "$VENV_PY" -c "import tkinter" 2>/dev/null; then
+if [[ "$ERR" -eq 0 && -n "$PYTHON" ]]; then
+  if ! "$PYTHON" -c "import tkinter" 2>/dev/null; then
     echo "NOTE: Tkinter is not available in this Python."
     echo "      Install it to run the GUI, for example:"
     echo "        Debian/Ubuntu: sudo apt install python3-tk"
@@ -246,7 +226,7 @@ if [[ "$ERR" -eq 0 ]]; then
   echo "     links for one-time import into data/catalog.db"
   echo "     (bot falls back to direct if none work)"
   echo "  3. Launch the control panel:"
-  echo "       .venv/bin/python app.py"
+  echo "       $PYTHON app.pyw"
   echo
   echo "All features (scraper, pings, subscription server) run from the GUI."
   echo "On Linux, \"Open top N proxies\" needs Telegram Desktop or a tg:// handler."

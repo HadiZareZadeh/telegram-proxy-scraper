@@ -11,8 +11,8 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.tl.custom.message import Message
 
 from fetch_mtproto.catalogs import open_catalogs
-from fetch_mtproto.mtproto.ping import check_and_reorganize, patch_telethon_faketls
-from fetch_mtproto.mtproto.store import ProxyCatalog
+from fetch_mtproto.mtproto.ping import PingResult, check_and_reorganize, patch_telethon_faketls
+from fetch_mtproto.mtproto.store import MTProtoProxy, ProxyCatalog
 from fetch_mtproto.scraper.client import connect_via_proxy
 from fetch_mtproto.scraper.ingest import ingest_message
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
@@ -99,6 +99,81 @@ async def watch_sources(
         len(entities),
     )
     await client.run_until_disconnected()
+
+
+async def watch_with_reconnect(
+    config: ModuleType,
+    client: TelegramClient,
+    current_proxy: MTProtoProxy | None,
+    sources: list,
+    mt_catalog: ProxyCatalog,
+    v2_catalog: V2RayCatalog,
+    catalog_lock: asyncio.Lock,
+) -> TelegramClient:
+    """Listen for new messages; reconnect via another proxy when the link drops."""
+    delay = float(getattr(config, "RECONNECT_DELAY", 5.0))
+    exclude_keys: set[str] = set()
+    entities = await resolve_sources(client, sources)
+    if not entities:
+        log.error("No watchable sources — exiting.")
+        return client
+
+    while True:
+        try:
+            await watch_sources(client, entities, mt_catalog, v2_catalog, catalog_lock)
+        except asyncio.CancelledError:
+            raise
+
+        log.warning("Telegram connection lost — switching proxy…")
+
+        if current_proxy is not None:
+            exclude_keys.add(current_proxy.key)
+            async with catalog_lock:
+                mt_catalog.apply_ping_results(
+                    [
+                        PingResult(
+                            proxy=current_proxy,
+                            latency=None,
+                            error="connection lost",
+                        )
+                    ]
+                )
+            log.info("Marked proxy as failed: %s", current_proxy.to_link())
+
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+        await asyncio.sleep(delay)
+
+        while True:
+            try:
+                client, current_proxy = await connect_via_proxy(
+                    config, mt_catalog, exclude_keys=exclude_keys
+                )
+            except Exception as exc:
+                log.error(
+                    "Reconnect failed: %s — retrying in %.0f seconds",
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            entities = await resolve_sources(client, sources)
+            if entities:
+                break
+
+            log.error(
+                "No watchable sources after reconnect — retrying in %.0f seconds",
+                delay,
+            )
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
 
 
 async def periodic_checks(
@@ -242,7 +317,7 @@ async def run_scraper(config: ModuleType) -> None:
         db.path.name,
     )
 
-    client = await connect_via_proxy(config, mt_catalog)
+    client, current_proxy = await connect_via_proxy(config, mt_catalog)
     check_task: asyncio.Task | None = None
     try:
         await ensure_authorized(client)
@@ -288,7 +363,15 @@ async def run_scraper(config: ModuleType) -> None:
             )
             log.info("Proxy / V2Ray re-check scheduled every %.0f seconds", interval)
 
-        await watch_sources(client, entities, mt_catalog, v2_catalog, catalog_lock)
+        client = await watch_with_reconnect(
+            config,
+            client,
+            current_proxy,
+            sources,
+            mt_catalog,
+            v2_catalog,
+            catalog_lock,
+        )
     finally:
         if check_task is not None:
             check_task.cancel()

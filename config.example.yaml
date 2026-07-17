@@ -42,6 +42,8 @@ v2ray:
 scraper:
   # How often main.py re-pings MTProto + V2Ray catalogs (seconds; 0 = disabled)
   proxy_check_interval: 1800
+  # Pause before reconnecting after a dropped Telegram connection (seconds)
+  reconnect_delay: 5
 
 mtproto:
   ping_concurrency: 100

@@ -7,7 +7,7 @@ Fetches unique Telegram MTProto proxies and V2Ray/Xray share links from channels
 ```
 fetch-mtproto/
 ├── app.py                   # single entry point (GUI control panel)
-├── setup.cmd                # Windows installer (Python, venv, deps, Xray, config)
+├── setup.cmd                # Windows installer (Python, deps, Xray, config)
 ├── setup.sh                 # Linux installer (same steps as setup.cmd)
 ├── config.example.yaml → config.yaml
 ├── requirements.txt
@@ -44,7 +44,7 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-Both installers look on **PATH first** for Python 3.10+ and Xray, skip `pip install` when dependencies are already in `.venv`, and only download Xray into the `xray/` folder when it is not found on PATH or locally. They also create `config.yaml` when missing. On Windows, Python 3.10+ is installed via winget only when not on PATH. On Linux, install Python 3.10+ yourself (e.g. `sudo apt install python3 python3-venv python3-tk` on Debian/Ubuntu).
+Both installers look on **PATH first** for Python 3.10+ and Xray, skip `pip install` when dependencies are already installed globally, and only download Xray into the `xray/` folder when it is not found on PATH or locally. They also create `config.yaml` when missing. On Windows, Python 3.10+ is installed via winget only when not on PATH. On Linux, install Python 3.10+ yourself (e.g. `sudo apt install python3 python3-pip python3-tk` on Debian/Ubuntu).
 
 Then edit `config.yaml`: set `telegram.api_id` / `telegram.api_hash` from https://my.telegram.org/apps and list `telegram.sources`.
 
@@ -53,13 +53,13 @@ Then edit `config.yaml`: set `telegram.api_id` / `telegram.api_hash` from https:
 **Windows**
 
 ```bat
-.venv\Scripts\pythonw.exe app.py
+pythonw app.pyw
 ```
 
 **Linux**
 
 ```bash
-.venv/bin/python app.py
+python3 app.pyw
 ```
 
 The control panel provides:

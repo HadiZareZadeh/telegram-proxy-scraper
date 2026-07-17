@@ -84,8 +84,7 @@
 2. روی فایل **`setup.cmd`** دوبار کلیک کنید (یا در Command Prompt همان پوشه بنویسید: `setup.cmd`).
 3. صبر کنید تا تمام شود. این اسکریپت خودکار:
    - **Python** (زبان برنامه) را اگر نباشد نصب می‌کند (معمولاً با winget)
-   - یک محیط مجازی **`.venv`** می‌سازد
-   - کتابخانه‌های لازم را نصب می‌کند
+   - کتابخانه‌های لازم را به‌صورت سراسری نصب می‌کند
    - در صورت نیاز **Xray** را برای تست V2Ray دانلود می‌کند
    - اگر **`config.yaml`** نباشد، از روی نمونهٔ **`config.example.yaml`** می‌سازد
 
@@ -139,14 +138,14 @@ telegram:
 2. در همان پوشهٔ پروژه، این مسیر را اجرا کنید:
 
 ```bat
-.venv\Scripts\pythonw.exe app.py
+pythonw app.pyw
 ```
 
 یا از **Command Prompt** در پوشهٔ پروژه:
 
 ```bat
 cd D:\project\telegram-proxy-scraper
-.venv\Scripts\pythonw.exe app.py
+pythonw app.pyw
 ```
 
 یک **پنجرهٔ «fetch-mtproto control panel»** باز می‌شود.
@@ -159,7 +158,7 @@ cd D:\project\telegram-proxy-scraper
 chmod +x setup.sh
 ./setup.sh
 # بعد از ویرایش config.yaml:
-.venv/bin/python app.py
+python3 app.pyw
 ```
 
 ---
@@ -222,7 +221,6 @@ chmod +x setup.sh
 | **`sessions/`** | فایل ورود تلگرام — **به اشتراک نگذارید** (مثل کلید حساب) |
 | **`logs/`** | گزارش‌های ذخیره‌شده از پنل |
 | **`xray/`** | برنامهٔ Xray برای تست V2Ray (اگر خودکار دانلود شده) |
-| **`.venv/`** | محیط Python — لازم نیست دست بزنید |
 
 ---
 
@@ -292,7 +290,7 @@ chmod +x setup.sh
 - از مسیر کامل استفاده کنید:
 
   ```bat
-  D:\project\telegram-proxy-scraper\.venv\Scripts\pythonw.exe D:\project\telegram-proxy-scraper\app.py
+  pythonw D:\project\telegram-proxy-scraper\app.pyw
   ```
 
 - یک‌بار با `python.exe` به‌جای `pythonw.exe` امتحان کنید تا خطا در پنجرهٔ سیاه دیده شود.

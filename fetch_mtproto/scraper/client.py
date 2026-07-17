@@ -92,28 +92,53 @@ async def connect_direct(config: ModuleType) -> TelegramClient:
     return client
 
 
-async def connect_via_proxy(
-    config: ModuleType, catalog: ProxyCatalog
-) -> TelegramClient:
-    """Connect via the first working proxy; fall back to direct if none work."""
-    timeout = float(getattr(config, "PING_TIMEOUT", 8.0))
+def _proxy_candidates(
+    catalog: ProxyCatalog,
+    config: ModuleType,
+    exclude_keys: set[str] | None = None,
+) -> list[MTProtoProxy]:
     seen: set[str] = set()
     candidates: list[MTProtoProxy] = []
     working = catalog.working.all()
     max_working = resolve_max_working(getattr(config, "MTPROTO_MAX_WORKING", 0))
     if max_working is not None:
         working = working[:max_working]
+    skip = exclude_keys or set()
     for proxy in (*working, *catalog.failed.all()):
-        if proxy.key in seen:
+        if proxy.key in seen or proxy.key in skip:
             continue
         seen.add(proxy.key)
         candidates.append(proxy)
+    return candidates
+
+
+async def connect_via_proxy(
+    config: ModuleType,
+    catalog: ProxyCatalog,
+    *,
+    exclude_keys: set[str] | None = None,
+) -> tuple[TelegramClient, MTProtoProxy | None]:
+    """Connect via the first working proxy; fall back to direct if none work.
+
+    Returns (client, proxy) where proxy is None when connected directly.
+    """
+    timeout = float(getattr(config, "PING_TIMEOUT", 8.0))
+    skip = set(exclude_keys or ())
+    candidates = _proxy_candidates(catalog, config, skip)
+
+    if not candidates and skip:
+        log.info(
+            "All %d proxy candidate(s) excluded this session — retrying full list.",
+            len(skip),
+        )
+        skip.clear()
+        candidates = _proxy_candidates(catalog, config, skip)
 
     if not candidates:
         log.warning(
             "No MTProto proxies in database — falling back to direct connection."
         )
-        return await connect_direct(config)
+        return await connect_direct(config), None
 
     log.info("Looking for a working proxy (%d candidate(s))…", len(candidates))
 
@@ -136,7 +161,7 @@ async def connect_via_proxy(
     )
     if found is None:
         log.warning("None of the stored MTProto proxies responded — trying direct.")
-        return await connect_direct(config)
+        return await connect_direct(config), None
 
     proxy, latency = found
     log.info("Using first working proxy (%.0f ms): %s", latency * 1000, proxy.to_link())
@@ -146,5 +171,5 @@ async def connect_via_proxy(
         client, f"proxy {proxy.server}:{proxy.port}", timeout=timeout
     ):
         log.warning("Chosen proxy failed to connect — trying direct.")
-        return await connect_direct(config)
-    return client
+        return await connect_direct(config), None
+    return client, proxy

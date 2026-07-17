@@ -12,7 +12,7 @@ echo.
 
 set "ERR=0"
 set "PYTHON="
-set "VENV_PY=%CD%\.venv\Scripts\python.exe"
+set "PYTHONW="
 set "REQUIREMENTS=%CD%\requirements.txt"
 set "XRAY_DIR=%CD%\xray"
 set "XRAY_EXE=%CD%\xray\xray.exe"
@@ -103,8 +103,15 @@ if not defined PYTHON (
 )
 goto :eof
 
+:resolve_pythonw
+set "PYTHONW="
+if not defined PYTHON goto :eof
+for %%I in ("%PYTHON%") do set "PYTHONW=%%~dpIpythonw.exe"
+if not exist "!PYTHONW!" set "PYTHONW=%PYTHON%"
+goto :eof
+
 :deps_satisfied
-"%VENV_PY%" -c "import telethon, python_socks, TelethonFakeTLS, cryptography" >nul 2>&1
+"%PYTHON%" -c "import telethon, python_socks, TelethonFakeTLS, cryptography" >nul 2>&1
 goto :eof
 
 :find_xray_on_path
@@ -123,7 +130,7 @@ goto :eof
 
 :main
 :: ---------- 1) Python ----------
-echo [1/6] Checking for installed Python 3.10+ ...
+echo [1/5] Checking for installed Python 3.10+ ...
 call :find_python
 if defined PYTHON (
   call :ok "Using installed Python: %PYTHON%"
@@ -152,52 +159,35 @@ if defined PYTHON (
   )
   call :ok "Installed Python 3.10.0: %PYTHON%"
 )
+call :resolve_pythonw
 echo.
 
-:: ---------- 2) Virtual environment ----------
-echo [2/6] Creating virtual environment (.venv) ...
-if exist "%VENV_PY%" (
-  call :ok "Existing .venv found"
-) else (
-  "%PYTHON%" -m venv "%CD%\.venv"
-  if errorlevel 1 (
-    call :fail "Failed to create .venv"
-    goto :done
-  )
-  call :ok "Created .venv"
-)
-if not exist "%VENV_PY%" (
-  call :fail "venv python missing: %VENV_PY%"
-  goto :done
-)
-echo.
-
-:: ---------- 3) Python packages ----------
-echo [3/6] Installing Python packages ...
+:: ---------- 2) Python packages ----------
+echo [2/5] Installing Python packages ...
 if not exist "%REQUIREMENTS%" (
   call :fail "requirements.txt not found"
   goto :done
 )
 call :deps_satisfied
 if not errorlevel 1 (
-  call :ok "Dependencies already installed in .venv"
+  call :ok "Dependencies already installed globally"
 ) else (
-  "%VENV_PY%" -m pip install --upgrade pip setuptools wheel
+  "%PYTHON%" -m pip install --upgrade pip setuptools wheel
   if errorlevel 1 (
     call :fail "pip upgrade failed"
     goto :done
   )
-  "%VENV_PY%" -m pip install -r "%REQUIREMENTS%"
+  "%PYTHON%" -m pip install -r "%REQUIREMENTS%"
   if errorlevel 1 (
     call :fail "pip install -r requirements.txt failed"
     goto :done
   )
-  call :ok "Dependencies installed"
+  call :ok "Dependencies installed globally"
 )
 echo.
 
-:: ---------- 4) Xray-core ----------
-echo [4/6] Checking Xray-core ...
+:: ---------- 3) Xray-core ----------
+echo [3/5] Checking Xray-core ...
 call :find_xray_on_path
 if defined XRAY_ON_PATH (
   call :ok "Using xray from PATH: !XRAY_ON_PATH!"
@@ -264,8 +254,8 @@ if defined XRAY_ON_PATH (
 )
 echo.
 
-:: ---------- 5) Config ----------
-echo [5/6] Checking config.yaml ...
+:: ---------- 4) Config ----------
+echo [4/5] Checking config.yaml ...
 if exist "%CD%\config.yaml" (
   call :ok "config.yaml already exists (left unchanged)"
 ) else if exist "%CD%\config.example.yaml" (
@@ -280,8 +270,8 @@ if exist "%CD%\config.yaml" (
 )
 echo.
 
-:: ---------- 6) Data directories ----------
-echo [6/6] Ensuring data folders ...
+:: ---------- 5) Data directories ----------
+echo [5/5] Ensuring data folders ...
 mkdir "%CD%\data" >nul 2>&1
 mkdir "%CD%\data\mtproto" >nul 2>&1
 mkdir "%CD%\data\v2ray" >nul 2>&1
@@ -302,7 +292,7 @@ if "%ERR%"=="0" (
   echo      links for one-time import into data\catalog.db
   echo      ^(bot falls back to direct if none work^)
   echo   3. Launch the control panel:
-  echo        .venv\Scripts\pythonw.exe app.py
+  echo        "!PYTHONW!" app.pyw
   echo.
   echo All features ^(scraper, pings, subscription server,
   echo open top proxies in Telegram^) run from the GUI.
