@@ -164,6 +164,51 @@ async def watch_sources(
     await client.run_until_disconnected()
 
 
+async def _reconnect_after_drop(
+    config: ModuleType,
+    client: TelegramClient,
+    current_proxy: MTProtoProxy | None,
+    mt_catalog: ProxyCatalog,
+    catalog_lock: asyncio.Lock,
+    exclude_keys: set[str],
+    delay: float,
+) -> tuple[TelegramClient, MTProtoProxy | None]:
+    """Mark the current proxy failed, disconnect, and connect via another proxy."""
+    log.warning("Telegram connection lost — switching proxy…")
+
+    if current_proxy is not None:
+        exclude_keys.add(current_proxy.key)
+        async with catalog_lock:
+            mt_catalog.apply_ping_results(
+                [
+                    PingResult(
+                        proxy=current_proxy,
+                        latency=None,
+                        error="connection lost",
+                    )
+                ]
+            )
+        log.info("Marked proxy as failed: %s", current_proxy.to_link())
+
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+    while True:
+        try:
+            return await connect_via_proxy(
+                config, mt_catalog, exclude_keys=exclude_keys
+            )
+        except Exception as exc:
+            log.error(
+                "Reconnect failed: %s — retrying in %.0f seconds",
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+
 async def watch_with_reconnect(
     config: ModuleType,
     client: TelegramClient,
@@ -194,6 +239,12 @@ async def watch_with_reconnect(
             )
         except asyncio.CancelledError:
             raise
+        except Exception as exc:
+            log.warning(
+                "Telegram connection error during watch (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
 
         pending: MTProtoProxy | None = None
         async with conn_state.lock:
@@ -237,41 +288,16 @@ async def watch_with_reconnect(
             await asyncio.sleep(delay)
             continue
 
-        log.warning("Telegram connection lost — switching proxy…")
-
-        if current_proxy is not None:
-            exclude_keys.add(current_proxy.key)
-            async with catalog_lock:
-                mt_catalog.apply_ping_results(
-                    [
-                        PingResult(
-                            proxy=current_proxy,
-                            latency=None,
-                            error="connection lost",
-                        )
-                    ]
-                )
-            log.info("Marked proxy as failed: %s", current_proxy.to_link())
-
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-
         while True:
-            try:
-                client, current_proxy = await connect_via_proxy(
-                    config, mt_catalog, exclude_keys=exclude_keys
-                )
-            except Exception as exc:
-                log.error(
-                    "Reconnect failed: %s — retrying in %.0f seconds",
-                    exc,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-
+            client, current_proxy = await _reconnect_after_drop(
+                config,
+                client,
+                current_proxy,
+                mt_catalog,
+                catalog_lock,
+                exclude_keys,
+                delay,
+            )
             conn_state.client = client
             conn_state.current_proxy = current_proxy
             entities = await resolve_sources(client, sources)
@@ -447,19 +473,46 @@ async def run_scraper(config: ModuleType) -> None:
 
         limit = getattr(config, "MESSAGES_PER_SOURCE", 500)
         ingest_kwargs = ingest_subscription_kwargs(config)
+        reconnect_delay = config_float(getattr(config, "RECONNECT_DELAY", None), 5.0)
+        exclude_keys: set[str] = set()
         mt_new = 0
         v2_new = 0
         for source in sources:
-            mt_n, v2_n = await scrape_source(
-                client,
-                source,
-                limit,
-                mt_catalog,
-                v2_catalog,
-                ingest_kwargs=ingest_kwargs,
-            )
-            mt_new += mt_n
-            v2_new += v2_n
+            while True:
+                try:
+                    mt_n, v2_n = await scrape_source(
+                        client,
+                        source,
+                        limit,
+                        mt_catalog,
+                        v2_catalog,
+                        ingest_kwargs=ingest_kwargs,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "Connection error while scanning %r (%s: %s) — reconnecting…",
+                        source,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    client, current_proxy = await _reconnect_after_drop(
+                        config,
+                        client,
+                        current_proxy,
+                        mt_catalog,
+                        catalog_lock,
+                        exclude_keys,
+                        reconnect_delay,
+                    )
+                    conn_state.client = client
+                    conn_state.current_proxy = current_proxy
+                    continue
+
+                mt_new += mt_n
+                v2_new += v2_n
+                break
 
         v2_ok, v2_fail = v2_catalog.counts()
         log.info(
