@@ -1,0 +1,605 @@
+"""All-in-one Tkinter GUI: scrape, ping, subscription server, open proxies."""
+
+from __future__ import annotations
+
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from dataclasses import dataclass, field
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+from fetch_mtproto.paths import LOGS_DIR, PROJECT_ROOT
+from fetch_mtproto.process_tree import kill_process_tree
+
+TELEGRAM_EXE = os.path.join(
+    os.environ.get("APPDATA", ""), "Telegram Desktop", "Telegram.exe"
+)
+
+
+@dataclass
+class Job:
+    """A subprocess task streamed into the GUI log."""
+
+    name: str
+    args: list[str]
+    long_running: bool = False
+    process: subprocess.Popen | None = field(default=None, repr=False)
+
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+
+class App:
+    JOBS: dict[str, dict] = {
+        "scrape": {
+            "label": "Scraper",
+            "module": "fetch_mtproto.cli.scrape",
+            "long_running": True,
+        },
+        "ping_mtproto": {
+            "label": "Ping MTProto",
+            "module": "fetch_mtproto.cli.ping_mtproto",
+            "long_running": False,
+        },
+        "ping_v2ray": {
+            "label": "Ping V2Ray",
+            "module": "fetch_mtproto.cli.ping_v2ray",
+            "long_running": False,
+        },
+        "serve": {
+            "label": "Subscription server",
+            "module": "fetch_mtproto.cli.update_subscription",
+            "long_running": True,
+        },
+    }
+
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("fetch-mtproto control panel")
+        self.root.geometry("980x640")
+        self.root.minsize(760, 480)
+
+        self.jobs: dict[str, Job] = {}
+        self.buttons: dict[str, ttk.Button] = {}
+        self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self.active_stdin: str | None = None
+
+        self._build_ui()
+        self.root.after(100, self._drain_log_queue)
+        self.root.after(300, self.refresh_status)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------ UI
+
+    @staticmethod
+    def _default_top_proxy_count() -> int:
+        try:
+            from fetch_mtproto.config_loader import load_config, resolve_max_working
+
+            config = load_config(required=False)
+            if config is not None:
+                cap = resolve_max_working(getattr(config, "MTPROTO_MAX_WORKING", 0))
+                if cap is not None:
+                    return cap
+        except Exception:
+            pass
+        return 10
+
+    def _build_ui(self) -> None:
+        top = ttk.Frame(self.root, padding=8)
+        top.pack(fill="x")
+
+        for key, spec in self.JOBS.items():
+            btn = ttk.Button(
+                top,
+                text=f"Start {spec['label']}" if spec["long_running"] else spec["label"],
+                command=lambda k=key: self.toggle_job(k),
+                width=22,
+            )
+            btn.pack(side="left", padx=4)
+            self.buttons[key] = btn
+
+        proxies_frame = ttk.Frame(self.root, padding=(8, 0))
+        proxies_frame.pack(fill="x")
+        ttk.Label(proxies_frame, text="Open top").pack(side="left")
+        top_default = self._default_top_proxy_count()
+        self.top_count = tk.IntVar(value=top_default)
+        self.top_spin = ttk.Spinbox(
+            proxies_frame,
+            from_=1,
+            to=max(50, top_default),
+            width=4,
+            textvariable=self.top_count,
+        )
+        self.top_spin.pack(side="left", padx=4)
+        ttk.Button(
+            proxies_frame,
+            text="proxies in Telegram",
+            command=self.open_top_proxies,
+        ).pack(side="left", padx=4)
+
+        ttk.Button(
+            proxies_frame, text="Refresh status", command=self.refresh_status
+        ).pack(side="right")
+        self.status_var = tk.StringVar(value="Status: loading…")
+        status_label = ttk.Label(proxies_frame, textvariable=self.status_var)
+        status_label.pack(side="right", padx=12)
+
+        self.log_wrap = tk.BooleanVar(value=True)
+        self.log_autoscroll = tk.BooleanVar(value=True)
+        self.log = scrolledtext.ScrolledText(
+            self.root, wrap="word", state="disabled", font=("Consolas", 9)
+        )
+        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+
+        bottom = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        bottom.pack(fill="x")
+        ttk.Label(bottom, text="Input (login code / phone):").pack(side="left")
+        self.stdin_entry = ttk.Entry(bottom)
+        self.stdin_entry.pack(side="left", fill="x", expand=True, padx=6)
+        self.stdin_entry.bind("<Return>", lambda _e: self.send_stdin())
+        ttk.Button(bottom, text="Send", command=self.send_stdin).pack(side="left")
+
+        self._attach_log_menu(self.log)
+        self._attach_entry_menu(self.stdin_entry)
+        self._attach_entry_menu(self.top_spin)
+        self._attach_status_menu(status_label)
+
+    # ------------------------------------------------------- context menus
+
+    def _popup_menu(self, menu: tk.Menu, event: tk.Event) -> str:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _clipboard_has_text(self) -> bool:
+        try:
+            return bool(self.root.clipboard_get())
+        except tk.TclError:
+            return False
+
+    def _attach_entry_menu(self, widget: tk.Widget) -> None:
+        """Cut / Copy / Paste / Delete / Select All / Clear for entry-like fields."""
+
+        def cut() -> None:
+            widget.event_generate("<<Cut>>")
+
+        def copy() -> None:
+            widget.event_generate("<<Copy>>")
+
+        def paste() -> None:
+            widget.event_generate("<<Paste>>")
+
+        def delete_sel() -> None:
+            widget.event_generate("<<Clear>>")
+
+        def select_all() -> None:
+            widget.selection_range(0, "end")
+            widget.icursor("end")
+
+        def clear_all() -> None:
+            widget.delete(0, "end")
+
+        def show(event: tk.Event) -> str:
+            widget.focus_set()
+            has_sel = widget.selection_present()
+            has_text = bool(widget.get())
+            menu = tk.Menu(widget, tearoff=0)
+            menu.add_command(
+                label="Cut", command=cut, state="normal" if has_sel else "disabled"
+            )
+            menu.add_command(
+                label="Copy", command=copy, state="normal" if has_sel else "disabled"
+            )
+            menu.add_command(
+                label="Paste",
+                command=paste,
+                state="normal" if self._clipboard_has_text() else "disabled",
+            )
+            menu.add_command(
+                label="Delete",
+                command=delete_sel,
+                state="normal" if has_sel else "disabled",
+            )
+            menu.add_separator()
+            menu.add_command(
+                label="Select All",
+                command=select_all,
+                state="normal" if has_text else "disabled",
+            )
+            menu.add_command(
+                label="Clear",
+                command=clear_all,
+                state="normal" if has_text else "disabled",
+            )
+            return self._popup_menu(menu, event)
+
+        widget.bind("<Button-3>", show)
+
+    def _attach_log_menu(self, widget: tk.Text) -> None:
+        """Read-only log: copy/select helpers plus save, clear and view options."""
+
+        def copy_selection() -> None:
+            widget.event_generate("<<Copy>>")
+
+        def select_all() -> None:
+            widget.tag_add("sel", "1.0", "end-1c")
+            widget.mark_set("insert", "end-1c")
+
+        def line_range(index: str) -> tuple[str, str]:
+            return f"{index} linestart", f"{index} lineend"
+
+        def select_line(index: str) -> None:
+            widget.tag_remove("sel", "1.0", "end")
+            start, end = line_range(index)
+            widget.tag_add("sel", start, end)
+
+        def copy_line(index: str) -> None:
+            start, end = line_range(index)
+            text = widget.get(start, end)
+            if text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+
+        def copy_all() -> None:
+            text = widget.get("1.0", "end-1c")
+            if text:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+
+        def save_as() -> None:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            path = filedialog.asksaveasfilename(
+                title="Save log",
+                defaultextension=".txt",
+                initialdir=str(LOGS_DIR),
+                initialfile=f"fetch-mtproto-log-{time.strftime('%Y%m%d-%H%M%S')}.txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            )
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(widget.get("1.0", "end-1c"))
+                self.log_line(f"[log] saved to {path}")
+            except OSError as exc:
+                messagebox.showerror("fetch-mtproto", f"Failed to save log: {exc}")
+
+        def clear_log() -> None:
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.configure(state="disabled")
+
+        def toggle_wrap() -> None:
+            widget.configure(wrap="word" if self.log_wrap.get() else "none")
+
+        def scroll_to_end() -> None:
+            widget.see("end")
+
+        def show(event: tk.Event) -> str:
+            index = widget.index(f"@{event.x},{event.y}")
+            has_sel = bool(widget.tag_ranges("sel"))
+            has_text = bool(widget.get("1.0", "end-1c"))
+            on_line = bool(widget.get(*line_range(index)).strip())
+            menu = tk.Menu(widget, tearoff=0)
+            menu.add_command(
+                label="Copy",
+                command=copy_selection,
+                state="normal" if has_sel else "disabled",
+            )
+            menu.add_command(
+                label="Copy Line",
+                command=lambda: copy_line(index),
+                state="normal" if on_line else "disabled",
+            )
+            menu.add_command(
+                label="Copy All",
+                command=copy_all,
+                state="normal" if has_text else "disabled",
+            )
+            menu.add_separator()
+            menu.add_command(
+                label="Select Line",
+                command=lambda: select_line(index),
+                state="normal" if on_line else "disabled",
+            )
+            menu.add_command(
+                label="Select All",
+                command=select_all,
+                state="normal" if has_text else "disabled",
+            )
+            menu.add_separator()
+            menu.add_command(
+                label="Save Log As…",
+                command=save_as,
+                state="normal" if has_text else "disabled",
+            )
+            menu.add_command(
+                label="Clear Log",
+                command=clear_log,
+                state="normal" if has_text else "disabled",
+            )
+            menu.add_separator()
+            menu.add_command(label="Scroll to End", command=scroll_to_end)
+            menu.add_checkbutton(
+                label="Word Wrap", variable=self.log_wrap, command=toggle_wrap
+            )
+            menu.add_checkbutton(
+                label="Auto-scroll on New Output", variable=self.log_autoscroll
+            )
+            return self._popup_menu(menu, event)
+
+        widget.bind("<Button-3>", show)
+        # Ctrl+A doesn't work on a disabled Text widget by default.
+        widget.bind("<Control-a>", lambda _e: (select_all(), "break")[1])
+
+    def _attach_status_menu(self, widget: tk.Widget) -> None:
+        def copy_status() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.status_var.get())
+
+        def show(event: tk.Event) -> str:
+            menu = tk.Menu(widget, tearoff=0)
+            menu.add_command(label="Copy Status", command=copy_status)
+            menu.add_command(label="Refresh Status", command=self.refresh_status)
+            return self._popup_menu(menu, event)
+
+        widget.bind("<Button-3>", show)
+
+    # ------------------------------------------------------------- logging
+
+    def log_line(self, text: str) -> None:
+        self.log_queue.put(text.rstrip("\n"))
+
+    def _drain_log_queue(self) -> None:
+        try:
+            lines: list[str] = []
+            while True:
+                lines.append(self.log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        if lines:
+            self.log.configure(state="normal")
+            self.log.insert("end", "\n".join(lines) + "\n")
+            if self.log_autoscroll.get():
+                self.log.see("end")
+            self.log.configure(state="disabled")
+        self.root.after(100, self._drain_log_queue)
+
+    # ---------------------------------------------------------------- jobs
+
+    def toggle_job(self, key: str) -> None:
+        spec = self.JOBS[key]
+        job = self.jobs.get(key)
+        if job is not None and job.running:
+            if spec["long_running"]:
+                self.stop_job(key)
+            else:
+                self.log_line(f"[{spec['label']}] already running…")
+            return
+        self.start_job(key)
+
+    def start_job(self, key: str) -> None:
+        spec = self.JOBS[key]
+        args = [sys.executable, "-u", "-m", spec["module"]]
+        # Force the child to emit UTF-8 so Persian / non-ASCII logs render
+        # correctly instead of falling back to \uXXXX escapes on Windows.
+        child_env = dict(os.environ)
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
+        popen_kw: dict = {
+            "cwd": str(PROJECT_ROOT),
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "env": child_env,
+        }
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            # Isolate CLI jobs in their own process group so tree kill is safe.
+            popen_kw["start_new_session"] = True
+        try:
+            process = subprocess.Popen(args, **popen_kw)
+        except OSError as exc:
+            messagebox.showerror("fetch-mtproto", f"Failed to start: {exc}")
+            return
+
+        job = Job(
+            name=key,
+            args=args,
+            long_running=spec["long_running"],
+            process=process,
+        )
+        self.jobs[key] = job
+        self.active_stdin = key
+        self.log_line(f"[{spec['label']}] started (pid {process.pid})")
+        if spec["long_running"]:
+            self.buttons[key].configure(text=f"Stop {spec['label']}")
+
+        threading.Thread(
+            target=self._pump_output, args=(key,), daemon=True
+        ).start()
+
+    def _pump_output(self, key: str) -> None:
+        spec = self.JOBS[key]
+        job = self.jobs[key]
+        assert job.process is not None and job.process.stdout is not None
+        buffer = ""
+        while True:
+            ch = job.process.stdout.read(1)
+            if ch == "":
+                break
+            if ch == "\n":
+                self.log_line(f"[{spec['label']}] {buffer}")
+                buffer = ""
+                continue
+            buffer += ch
+            # Show input() prompts (they end with ': ' and have no newline)
+            if buffer.endswith(": "):
+                self.log_line(f"[{spec['label']}] {buffer}")
+                buffer = ""
+        if buffer:
+            self.log_line(f"[{spec['label']}] {buffer}")
+        code = job.process.wait()
+        self.log_line(f"[{spec['label']}] exited with code {code}")
+        self.root.after(0, self._job_finished, key)
+
+    def _job_finished(self, key: str) -> None:
+        spec = self.JOBS[key]
+        if spec["long_running"]:
+            self.buttons[key].configure(text=f"Start {spec['label']}")
+        if self.active_stdin == key:
+            self.active_stdin = None
+        self.refresh_status()
+
+    def stop_job(self, key: str) -> None:
+        job = self.jobs.get(key)
+        if job is None or not job.running:
+            return
+        spec = self.JOBS[key]
+        self.log_line(f"[{spec['label']}] stopping…")
+        assert job.process is not None
+        kill_process_tree(job.process)
+
+    def send_stdin(self) -> None:
+        text = self.stdin_entry.get()
+        self.stdin_entry.delete(0, "end")
+        key = self.active_stdin
+        if key is None or not self.jobs.get(key, Job("", [])).running:
+            running = [k for k, j in self.jobs.items() if j.running]
+            key = running[0] if running else None
+        if key is None:
+            self.log_line("[input] no running task to send input to")
+            return
+        job = self.jobs[key]
+        assert job.process is not None and job.process.stdin is not None
+        try:
+            job.process.stdin.write(text + "\n")
+            job.process.stdin.flush()
+            self.log_line(f"[input → {self.JOBS[key]['label']}] {text}")
+        except OSError as exc:
+            self.log_line(f"[input] failed: {exc}")
+
+    # ------------------------------------------------------------- actions
+
+    def open_top_proxies(self) -> None:
+        count = max(1, int(self.top_count.get()))
+        threading.Thread(
+            target=self._open_top_proxies_worker, args=(count,), daemon=True
+        ).start()
+
+    def _open_top_proxies_worker(self, count: int) -> None:
+        from fetch_mtproto.catalogs import open_catalogs
+        from fetch_mtproto.config_loader import load_config
+
+        config = load_config(required=False)
+        db, catalog, _v2 = open_catalogs(config)
+        try:
+            cap = None
+            if config is not None:
+                from fetch_mtproto.config_loader import resolve_max_working
+
+                cap = resolve_max_working(getattr(config, "MTPROTO_MAX_WORKING", 0))
+            count = min(count, cap) if cap is not None else count
+            proxies = catalog.working.all()[:count]
+        finally:
+            db.close()
+
+        if not proxies:
+            self.log_line(
+                "[proxies] no working MTProto proxies — run Ping MTProto first"
+            )
+            return
+
+        use_exe = os.path.exists(TELEGRAM_EXE)
+        if not use_exe:
+            self.log_line(
+                "[proxies] Telegram Desktop not found — using tg:// protocol handler"
+            )
+        self.log_line(
+            f"[proxies] opening {len(proxies)} link(s) in Telegram "
+            "(accept each 'Enable proxy?' prompt)"
+        )
+        for i, proxy in enumerate(proxies, 1):
+            link = proxy.to_link()
+            self.log_line(f"[proxies] [{i}/{len(proxies)}] {link}")
+            try:
+                if use_exe:
+                    subprocess.Popen([TELEGRAM_EXE, "--", link])
+                else:
+                    os.startfile(link)  # tg:// handler
+            except OSError as exc:
+                self.log_line(f"[proxies] failed to open: {exc}")
+                return
+            if i < len(proxies):
+                time.sleep(2)
+        self.log_line("[proxies] done — check Telegram Settings → Connection type")
+
+    def refresh_status(self) -> None:
+        threading.Thread(target=self._refresh_status_worker, daemon=True).start()
+
+    def _refresh_status_worker(self) -> None:
+        try:
+            from fetch_mtproto.catalogs import open_catalogs
+            from fetch_mtproto.config_loader import load_config
+
+            config = load_config(required=False)
+            db, mt, v2 = open_catalogs(config)
+            try:
+                mt_h = db.mtproto_health_summary()
+                v2_h = db.v2ray_health_summary()
+            finally:
+                db.close()
+            mt_avg = f", ~{mt_h['avg_ok_ms']:.0f}ms" if mt_h["avg_ok_ms"] else ""
+            v2_avg = f", ~{v2_h['avg_ok_ms']:.0f}ms" if v2_h["avg_ok_ms"] else ""
+            text = (
+                f"MTProto {mt_h['working']}/{mt_h['total']} ok "
+                f"(Σ✓{mt_h['successes']} Σ✗{mt_h['failures']}{mt_avg}) · "
+                f"V2Ray {v2_h['working']}/{v2_h['total']} ok "
+                f"(Σ✓{v2_h['successes']} Σ✗{v2_h['failures']}{v2_avg})"
+            )
+        except Exception as exc:
+            text = f"status error: {exc}"
+        self.root.after(0, self.status_var.set, f"Status: {text}")
+
+    # ------------------------------------------------------------ shutdown
+
+    def _on_close(self) -> None:
+        running = [k for k, j in self.jobs.items() if j.running]
+        if running:
+            labels = ", ".join(self.JOBS[k]["label"] for k in running)
+            if not messagebox.askyesno(
+                "fetch-mtproto", f"Stop running tasks and exit?\n({labels})"
+            ):
+                return
+            for key in running:
+                job = self.jobs[key]
+                if job.process is not None:
+                    kill_process_tree(job.process)
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.log_line("fetch-mtproto control panel ready.")
+        self.log_line(
+            "Scraper login: when prompted, type phone / code below and press Send."
+        )
+        self.root.mainloop()
+
+
+def main() -> None:
+    App().run()
+
+
+if __name__ == "__main__":
+    main()

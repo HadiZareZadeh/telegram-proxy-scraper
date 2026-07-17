@@ -1,0 +1,49 @@
+# Copy this file to config.yaml and fill in your values.
+# Get api_id / api_hash from https://my.telegram.org/apps
+
+telegram:
+  api_id: 12345678      # <- replace with your api_id
+  api_hash: "your_api_hash_here"
+  session_name: mtproto_scraper  # stored in sessions/
+  # Channels / groups you already joined (usernames, invite links, or numeric IDs)
+  # Examples: "@proxychannel", "https://t.me/proxychannel", -1001234567890
+  sources:
+    - "@ShadowProxy66"
+    - "@Gp_config"
+    - "@meliproxyy"
+    - "@PinkProxy"
+  # How many recent messages to scan per source (null = all history; can be slow)
+  messages_per_source: 500
+
+storage:
+  database_file: data/catalog.db
+  subscription_file: data/subscription.txt
+
+xray:
+  # null = auto-detect PATH, then xray/xray.exe or xray/xray
+  bin: null
+
+v2ray:
+  # HTTP URL fetched through each V2Ray proxy (latency = TTFB). Default is an empty 204.
+  # Set test_bytes > 0 only if you want to also read that many body bytes.
+  test_url: http://www.gstatic.com/generate_204
+  test_bytes: 0
+  test_timeout: 8.0
+  ping_concurrency: 20
+  # Max working servers to keep, probe per cycle, and export to subscription.txt (0 = unlimited)
+  max_working: 50
+
+scraper:
+  # How often main.py re-pings MTProto + V2Ray catalogs (seconds; 0 = disabled)
+  proxy_check_interval: 1800
+
+mtproto:
+  ping_concurrency: 100
+  ping_timeout: 8.0
+  # Max working proxies to keep and probe per cycle (fastest first); 0 = unlimited
+  max_working: 50
+
+probe:
+  # Adaptive probe scheduler (explore / exploit / recover)
+  # Skip chronic failures until their backoff window expires.
+  respect_backoff: true

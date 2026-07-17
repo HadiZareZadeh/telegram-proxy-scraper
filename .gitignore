@@ -1,0 +1,38 @@
+# User config & secrets
+config.yaml
+.env
+
+# Telegram session files
+sessions/
+
+# Saved GUI / debug logs
+logs/
+
+# Runtime catalogs & exports (auto-created on first run)
+data/
+
+# SQLite WAL sidecars (if DATABASE_FILE is moved outside data/)
+*.db-wal
+*.db-shm
+
+# Xray-core (downloaded by setup.cmd / setup.sh when not on PATH)
+xray/
+# Legacy install locations
+xray.exe
+xray
+geoip.dat
+geosite.dat
+bin/xray.exe
+bin/xray
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local test / debug output (legacy root paths)
+*.session
+*.session-journal
+_ping_*
+ping_test_*
