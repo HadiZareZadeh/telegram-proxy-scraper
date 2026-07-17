@@ -42,18 +42,24 @@ def make_client(
     session: str,
     proxy: MTProtoProxy | None = None,
     *,
-    connection_retries: int = 2,
+    connection_retries: int | None = None,
+    auto_reconnect: bool | None = None,
 ) -> TelegramClient:
     kwargs: dict = {
         "session": _session_path(session),
         "api_id": config.API_ID,
         "api_hash": config.API_HASH,
-        "connection_retries": connection_retries,
         "retry_delay": 1,
     }
     if proxy is not None:
+        # One attempt per proxy; let watch_with_reconnect pick the next on failure.
+        kwargs["connection_retries"] = 0 if connection_retries is None else connection_retries
+        kwargs["auto_reconnect"] = False if auto_reconnect is None else auto_reconnect
         kwargs["connection"] = _connection_for_proxy(proxy)
         kwargs["proxy"] = proxy.as_telethon_tuple()
+    else:
+        kwargs["connection_retries"] = 2 if connection_retries is None else connection_retries
+        kwargs["auto_reconnect"] = True if auto_reconnect is None else auto_reconnect
     return TelegramClient(**kwargs)
 
 
@@ -183,8 +189,6 @@ async def connect_via_proxy(
         )
         return await connect_direct(config), None
 
-    log.info("Looking for a working proxy (%d candidate(s))…", len(candidates))
-
     def _progress(done: int, total: int, result) -> None:
         if result.ok and result.latency is not None:
             log.info(
@@ -197,28 +201,36 @@ async def connect_via_proxy(
         else:
             log.info("[%d/%d] FAIL %s", done, total, result.proxy.to_link())
 
-    found = await find_first_working_proxy(
-        candidates,
-        timeout=timeout,
-        on_result=_progress,
-    )
-    if found is None:
-        log.warning("None of the stored MTProto proxies responded — trying direct.")
-        return await connect_direct(config), None
+    while candidates:
+        log.info("Looking for a working proxy (%d candidate(s))…", len(candidates))
 
-    proxy, latency = found
-    log.info("Using first working proxy (%.0f ms): %s", latency * 1000, proxy.to_link())
+        found = await find_first_working_proxy(
+            candidates,
+            timeout=timeout,
+            on_result=_progress,
+        )
+        if found is None:
+            break
 
-    client = make_client(config, config.SESSION_NAME, proxy=proxy)
-    ok, err = await try_connect(
-        client, f"proxy {proxy.server}:{proxy.port}", timeout=timeout
-    )
-    if not ok:
+        proxy, latency = found
+        log.info("Using first working proxy (%.0f ms): %s", latency * 1000, proxy.to_link())
+
+        client = make_client(config, config.SESSION_NAME, proxy=proxy)
+        ok, err = await try_connect(
+            client, f"proxy {proxy.server}:{proxy.port}", timeout=timeout
+        )
+        if ok:
+            return client, proxy
+
         if isinstance(err, AuthKeyDuplicatedError):
             raise RuntimeError(
                 "Telegram session invalidated (used from two IPs at once). "
                 f"Delete sessions/{config.SESSION_NAME}.session and log in again."
             ) from err
-        log.warning("Chosen proxy failed to connect — trying direct.")
-        return await connect_direct(config), None
-    return client, proxy
+
+        log.warning("Proxy failed to connect — trying next candidate.")
+        skip.add(proxy.key)
+        candidates = _proxy_candidates(catalog, config, skip)
+
+    log.warning("None of the stored MTProto proxies connected — trying direct.")
+    return await connect_direct(config), None

@@ -84,20 +84,6 @@ class App:
 
     # ------------------------------------------------------------------ UI
 
-    @staticmethod
-    def _default_top_proxy_count() -> int:
-        try:
-            from fetch_mtproto.config_loader import load_config, resolve_max_working
-
-            config = load_config(required=False)
-            if config is not None:
-                cap = resolve_max_working(getattr(config, "MTPROTO_MAX_WORKING", 0))
-                if cap is not None:
-                    return cap
-        except Exception:
-            pass
-        return 10
-
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill="x")
@@ -115,12 +101,11 @@ class App:
         proxies_frame = ttk.Frame(self.root, padding=(8, 0))
         proxies_frame.pack(fill="x")
         ttk.Label(proxies_frame, text="Open top").pack(side="left")
-        top_default = self._default_top_proxy_count()
-        self.top_count = tk.IntVar(value=top_default)
+        self.top_count = tk.IntVar(value=10)
         self.top_spin = ttk.Spinbox(
             proxies_frame,
             from_=1,
-            to=max(50, top_default),
+            to=50,
             width=4,
             textvariable=self.top_count,
         )
@@ -660,15 +645,11 @@ class App:
 
     def _load_top_proxies(self, count: int):
         from fetch_mtproto.catalogs import open_catalogs
-        from fetch_mtproto.config_loader import load_config, resolve_max_working
+        from fetch_mtproto.config_loader import load_config
 
         config = load_config(required=False)
         db, catalog, _v2 = open_catalogs(config)
         try:
-            cap = None
-            if config is not None:
-                cap = resolve_max_working(getattr(config, "MTPROTO_MAX_WORKING", 0))
-            count = min(count, cap) if cap is not None else count
             return catalog.working.all()[:count]
         finally:
             db.close()

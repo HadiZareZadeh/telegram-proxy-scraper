@@ -211,6 +211,7 @@ async def watch_with_reconnect(
                     "Switch to fastest proxy failed: %s — trying another proxy",
                     exc,
                 )
+                exclude_keys.add(pending.key)
                 try:
                     await client.disconnect()
                 except Exception:
@@ -256,8 +257,6 @@ async def watch_with_reconnect(
             await client.disconnect()
         except Exception:
             pass
-
-        await asyncio.sleep(delay)
 
         while True:
             try:
