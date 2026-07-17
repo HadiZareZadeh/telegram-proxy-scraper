@@ -36,3 +36,5 @@ venv/
 *.session-journal
 _ping_*
 ping_test_*
+
+*.rar

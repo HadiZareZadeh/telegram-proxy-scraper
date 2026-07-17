@@ -9,7 +9,7 @@ from types import ModuleType
 from telethon import TelegramClient, connection
 from telethon.tl.functions.help import GetConfigRequest
 
-from fetch_mtproto.config_loader import resolve_max_working
+from fetch_mtproto.config_loader import config_float, resolve_max_working
 from fetch_mtproto.mtproto.ping import find_first_working_proxy
 from fetch_mtproto.mtproto.store import MTProtoProxy, ProxyCatalog
 from fetch_mtproto.paths import session_path
@@ -82,7 +82,7 @@ async def try_connect(
 async def connect_direct(config: ModuleType) -> TelegramClient:
     """Connect to Telegram without a proxy."""
     log.info("Connecting without proxy…")
-    timeout = float(getattr(config, "PING_TIMEOUT", 8.0))
+    timeout = config_float(getattr(config, "PING_TIMEOUT", None), 8.0)
     client = make_client(config, config.SESSION_NAME, proxy=None)
     if not await try_connect(client, "direct (no proxy)", timeout=timeout):
         raise RuntimeError(
@@ -122,7 +122,7 @@ async def connect_via_proxy(
 
     Returns (client, proxy) where proxy is None when connected directly.
     """
-    timeout = float(getattr(config, "PING_TIMEOUT", 8.0))
+    timeout = config_float(getattr(config, "PING_TIMEOUT", None), 8.0)
     skip = set(exclude_keys or ())
     candidates = _proxy_candidates(catalog, config, skip)
 

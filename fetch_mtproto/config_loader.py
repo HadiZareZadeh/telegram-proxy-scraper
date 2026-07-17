@@ -58,6 +58,16 @@ def _parse_config(path: Path) -> SimpleNamespace:
     return SimpleNamespace(**attrs)
 
 
+def config_float(value: object, default: float) -> float:
+    """Coerce a config value to float; use default when missing or null."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def resolve_max_working(value: object) -> int | None:
     """Return a positive cap, or None when unlimited (0 / missing / invalid)."""
     try:

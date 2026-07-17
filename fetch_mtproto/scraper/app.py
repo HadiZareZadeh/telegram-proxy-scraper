@@ -11,6 +11,7 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.tl.custom.message import Message
 
 from fetch_mtproto.catalogs import open_catalogs
+from fetch_mtproto.config_loader import config_float
 from fetch_mtproto.mtproto.ping import PingResult, check_and_reorganize, patch_telethon_faketls
 from fetch_mtproto.mtproto.store import MTProtoProxy, ProxyCatalog
 from fetch_mtproto.scraper.client import connect_via_proxy
@@ -111,7 +112,7 @@ async def watch_with_reconnect(
     catalog_lock: asyncio.Lock,
 ) -> TelegramClient:
     """Listen for new messages; reconnect via another proxy when the link drops."""
-    delay = float(getattr(config, "RECONNECT_DELAY", 5.0))
+    delay = config_float(getattr(config, "RECONNECT_DELAY", None), 5.0)
     exclude_keys: set[str] = set()
     entities = await resolve_sources(client, sources)
     if not entities:
@@ -354,7 +355,7 @@ async def run_scraper(config: ModuleType) -> None:
             log.error("No watchable sources — exiting.")
             return
 
-        interval = float(getattr(config, "PROXY_CHECK_INTERVAL", 1800))
+        interval = config_float(getattr(config, "PROXY_CHECK_INTERVAL", None), 1800)
         if interval > 0:
             check_task = asyncio.create_task(
                 periodic_checks(
