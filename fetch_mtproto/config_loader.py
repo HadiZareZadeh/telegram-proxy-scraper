@@ -22,6 +22,7 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("storage", "subscription_file", "SUBSCRIPTION_FILE"),
     ("subscription_server", "host", "SUBSCRIPTION_SERVER_HOST"),
     ("subscription_server", "port", "SUBSCRIPTION_SERVER_PORT"),
+    ("subscription_server", "lan_ip", "SUBSCRIPTION_SERVER_LAN_IP"),
     ("storage", "proxies_file", "PROXIES_FILE"),
     ("storage", "failed_proxies_file", "FAILED_PROXIES_FILE"),
     ("storage", "v2ray_dir", "V2RAY_DIR"),

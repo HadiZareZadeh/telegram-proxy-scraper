@@ -550,14 +550,16 @@ class App:
     def _show_subscription_panel(
         self, bind_host: str, port: int, filename: str
     ) -> None:
+        from fetch_mtproto.config_loader import load_config
         from fetch_mtproto.subscription_server import (
             make_qr_photoimage,
             primary_subscription_url,
             subscription_urls,
         )
 
+        config = load_config(required=False)
         self._subscription_urls = subscription_urls(
-            bind_host=bind_host, port=port, filename=filename
+            bind_host=bind_host, port=port, filename=filename, config=config
         )
         lines = [f"{label}: {url}" for label, url in self._subscription_urls]
         self.sub_urls_box.configure(state="normal")
@@ -566,7 +568,7 @@ class App:
         self.sub_urls_box.configure(state="disabled")
 
         primary = primary_subscription_url(
-            bind_host=bind_host, port=port, filename=filename
+            bind_host=bind_host, port=port, filename=filename, config=config
         )
         self._qr_photo = make_qr_photoimage(primary)
         if self._qr_photo is not None:
@@ -595,7 +597,7 @@ class App:
             return
         # Reconstruct primary from stored URLs (LAN preferred).
         for label, url in self._subscription_urls:
-            if label == "LAN":
+            if label == "LAN" or label.startswith("LAN ("):
                 self.root.clipboard_clear()
                 self.root.clipboard_append(url)
                 self.log_line(f"[subscription] copied LAN URL: {url}")

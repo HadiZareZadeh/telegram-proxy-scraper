@@ -23,6 +23,7 @@ subscription_server:
   # 0.0.0.0 = reachable from other devices on your LAN (phones, tablets, etc.)
   host: 0.0.0.0
   port: 8765
+  # lan_ip: 192.168.1.105  # optional: force LAN URL/QR when VPN/TUN is active
 
 xray:
   # null = auto-detect PATH, then xray/xray.exe or xray/xray
