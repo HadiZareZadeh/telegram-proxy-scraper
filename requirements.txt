@@ -1,6 +1,8 @@
+setuptools<81
 telethon>=1.36.0
 python-socks[asyncio]>=2.4.0
 TelethonFakeTLS>=2022.4.4
 cryptography>=41.0.0
 PyYAML>=6.0.0
-qrcode[pil]>=7.4.0
+Pillow==10.4.0
+qrcode>=7.4.0
