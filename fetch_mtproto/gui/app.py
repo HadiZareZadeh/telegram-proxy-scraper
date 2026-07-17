@@ -130,6 +130,11 @@ class App:
             text="proxies in Telegram",
             command=self.open_top_proxies,
         ).pack(side="left", padx=4)
+        ttk.Button(
+            proxies_frame,
+            text="copy 10 links",
+            command=self.copy_top_proxies,
+        ).pack(side="left", padx=4)
 
         ttk.Button(
             proxies_frame, text="Refresh status", command=self.refresh_status
@@ -653,28 +658,41 @@ class App:
 
     # ------------------------------------------------------------- actions
 
-    def open_top_proxies(self) -> None:
-        count = max(1, int(self.top_count.get()))
-        threading.Thread(
-            target=self._open_top_proxies_worker, args=(count,), daemon=True
-        ).start()
-
-    def _open_top_proxies_worker(self, count: int) -> None:
+    def _load_top_proxies(self, count: int):
         from fetch_mtproto.catalogs import open_catalogs
-        from fetch_mtproto.config_loader import load_config
+        from fetch_mtproto.config_loader import load_config, resolve_max_working
 
         config = load_config(required=False)
         db, catalog, _v2 = open_catalogs(config)
         try:
             cap = None
             if config is not None:
-                from fetch_mtproto.config_loader import resolve_max_working
-
                 cap = resolve_max_working(getattr(config, "MTPROTO_MAX_WORKING", 0))
             count = min(count, cap) if cap is not None else count
-            proxies = catalog.working.all()[:count]
+            return catalog.working.all()[:count]
         finally:
             db.close()
+
+    def open_top_proxies(self) -> None:
+        count = max(1, int(self.top_count.get()))
+        threading.Thread(
+            target=self._open_top_proxies_worker, args=(count,), daemon=True
+        ).start()
+
+    def copy_top_proxies(self) -> None:
+        proxies = self._load_top_proxies(10)
+        if not proxies:
+            self.log_line(
+                "[proxies] no working MTProto proxies — run Ping MTProto first"
+            )
+            return
+        text = "\n".join(proxy.to_link() for proxy in proxies)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.log_line(f"[proxies] copied {len(proxies)} link(s) to clipboard")
+
+    def _open_top_proxies_worker(self, count: int) -> None:
+        proxies = self._load_top_proxies(count)
 
         if not proxies:
             self.log_line(
