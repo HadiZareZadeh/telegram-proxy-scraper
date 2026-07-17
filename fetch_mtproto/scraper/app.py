@@ -53,7 +53,12 @@ async def scrape_source(
         if not isinstance(message, Message):
             continue
         mt_n, v2_n = await ingest_message(
-            message, mt_catalog, v2_catalog, label=str(title), **(ingest_kwargs or {})
+            message,
+            mt_catalog,
+            v2_catalog,
+            client=client,
+            label=str(title),
+            **(ingest_kwargs or {}),
         )
         mt_total += mt_n
         v2_total += v2_n
@@ -103,6 +108,7 @@ async def watch_sources(
                 message,
                 mt_catalog,
                 v2_catalog,
+                client=client,
                 label=str(label),
                 **(ingest_kwargs or {}),
             )

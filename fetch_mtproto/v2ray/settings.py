@@ -47,8 +47,10 @@ def v2ray_subscription_expand_kwargs(config) -> dict:
 def ingest_subscription_kwargs(config) -> dict:
     """Keyword args for ingest_message subscription expansion."""
     sub = v2ray_subscription_expand_kwargs(config)
+    enabled = getattr(config, "V2RAY_PARSE_NAPSTERNET_ATTACHMENTS", True)
     return {
         "expand_subscriptions": sub["fetch_urls"],
         "subscription_fetch_timeout": sub["timeout"],
         "subscription_max_urls": sub["max_urls"],
+        "parse_napsternet_attachments": enabled is not False,
     }

@@ -45,6 +45,8 @@ v2ray:
   subscription_fetch_timeout: 15.0
   # Max HTTP sub URLs fetched per Telegram message (inline Base64 is always scanned)
   subscription_max_urls_per_message: 5
+  # Download .npv4 / .npv attachments and extract embedded V2Ray share links (non-encrypted only)
+  parse_napsternet_attachments: true
 
 scraper:
   # How often main.py re-pings MTProto + V2Ray catalogs (seconds; 0 = disabled)
