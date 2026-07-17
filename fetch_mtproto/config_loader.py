@@ -37,6 +37,7 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("mtproto", "ping_timeout", "PING_TIMEOUT"),
     ("mtproto", "max_working", "MTPROTO_MAX_WORKING"),
     ("v2ray", "max_working", "V2RAY_MAX_WORKING"),
+    ("v2ray", "subscription_limit", "V2RAY_SUBSCRIPTION_LIMIT"),
     ("probe", "respect_backoff", "PROBE_RESPECT_BACKOFF"),
 )
 
@@ -74,6 +75,17 @@ def resolve_max_working(value: object) -> int | None:
         n = int(value or 0)
     except (TypeError, ValueError):
         return None
+    return n if n > 0 else None
+
+
+def resolve_subscription_limit(value: object, *, default: int = 100) -> int | None:
+    """Return subscription export cap; default 100; 0 = unlimited."""
+    if value is None:
+        return default if default > 0 else None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default if default > 0 else None
     return n if n > 0 else None
 
 

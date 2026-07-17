@@ -36,8 +36,10 @@ v2ray:
   test_bytes: 0
   test_timeout: 8.0
   ping_concurrency: 20
-  # Stop probing once this many working servers are found; also caps subscription export (0 = unlimited)
+  # Stop probing once this many working servers are found (0 = unlimited)
   max_working: 0
+  # Fastest, most recently checked working servers exported to subscription.txt (0 = unlimited)
+  subscription_limit: 100
 
 scraper:
   # How often main.py re-pings MTProto + V2Ray catalogs (seconds; 0 = disabled)

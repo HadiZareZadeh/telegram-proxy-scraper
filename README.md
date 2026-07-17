@@ -108,7 +108,7 @@ Probes are ordered by **highest `priority_score` first**:
 2. **Exploit** — high success rate + low latency stay near the front.
 3. **Recover** — chronic failures drop down but get sparse retries after exponential backoff (`PROBE_RESPECT_BACKOFF`).
 
-Optional `MTPROTO_MAX_WORKING` / `V2RAY_MAX_WORKING` cap how many top-scoring servers are tested each cycle and kept in the working set (0 = unlimited).
+Optional `MTPROTO_MAX_WORKING` / `V2RAY_MAX_WORKING` cap how many top-scoring servers are tested each cycle and kept in the working set (0 = unlimited). `V2RAY_SUBSCRIPTION_LIMIT` (default 100) controls how many fastest, most recently checked working servers are exported to `subscription.txt` (0 = unlimited).
 
 ## Behavior
 

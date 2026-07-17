@@ -378,11 +378,13 @@ class V2RayCatalog:
         subscription_path: str | Path,
         schemes: tuple[str, ...] = V2RAY_SCHEMES,
         max_working: int | None = None,
+        subscription_limit: int | None = 100,
     ) -> None:
         self.db = db
         self.schemes = schemes
         self.subscription_path = Path(subscription_path)
         self.max_working = max_working
+        self.subscription_limit = subscription_limit
         self.working: dict[str, _V2RayView] = {
             scheme: _V2RayView(db, scheme, "working") for scheme in schemes
         }
@@ -426,10 +428,8 @@ class V2RayCatalog:
         return self.db.v2ray_count("working"), self.db.v2ray_count("failed")
 
     def update_subscription(self) -> int:
-        """Write top working servers to the combined subscription export."""
-        rows = self.db.v2ray_list("working")
-        if self.max_working is not None:
-            rows = rows[: self.max_working]
+        """Write fastest, most recently checked working servers to the subscription export."""
+        rows = self.db.v2ray_subscription_list(self.subscription_limit)
         servers = [_server_from_row(row) for row in rows]
         return write_subscription(servers, self.subscription_path)
 

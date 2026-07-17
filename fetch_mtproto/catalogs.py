@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fetch_mtproto.config_loader import resolve_max_working
+from fetch_mtproto.config_loader import resolve_max_working, resolve_subscription_limit
 from fetch_mtproto.db import CatalogDB
 from fetch_mtproto.mtproto.store import ProxyCatalog, load_mtproto_from_text_file
 from fetch_mtproto.paths import PROJECT_ROOT
@@ -103,13 +103,18 @@ def open_catalogs(config_module=None) -> tuple[CatalogDB, ProxyCatalog, V2RayCat
     migrate_legacy_text_files(db, config_module)
     mt_max = None
     v2_max = None
+    v2_sub_limit = 100
     if config_module is not None:
         mt_max = resolve_max_working(getattr(config_module, "MTPROTO_MAX_WORKING", 0))
         v2_max = resolve_max_working(getattr(config_module, "V2RAY_MAX_WORKING", 0))
+        v2_sub_limit = resolve_subscription_limit(
+            getattr(config_module, "V2RAY_SUBSCRIPTION_LIMIT", None)
+        )
     mt_catalog = ProxyCatalog(db, max_working=mt_max)
     v2_catalog = V2RayCatalog(
         db,
         subscription_path=subscription_path(config_module),
         max_working=v2_max,
+        subscription_limit=v2_sub_limit,
     )
     return db, mt_catalog, v2_catalog

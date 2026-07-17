@@ -491,6 +491,22 @@ class CatalogDB:
         ).fetchone()
         return row is not None
 
+    def v2ray_subscription_list(self, limit: int | None = None) -> list[sqlite3.Row]:
+        """Working servers for subscription export: fastest first, then most recently checked."""
+        order = (
+            "CASE WHEN last_latency_ms IS NULL THEN 1 ELSE 0 END, "
+            "last_latency_ms ASC, "
+            "CASE WHEN last_checked_at IS NULL THEN 1 ELSE 0 END, "
+            "last_checked_at DESC, "
+            "updated_at DESC, "
+            "priority_score DESC, "
+            "key"
+        )
+        query = f"SELECT * FROM v2ray WHERE status = 'working' ORDER BY {order}"
+        if limit is not None and limit > 0:
+            query += f" LIMIT {int(limit)}"
+        return list(self.conn.execute(query))
+
     def v2ray_list(
         self, status: str, scheme: str | None = None
     ) -> list[sqlite3.Row]:
