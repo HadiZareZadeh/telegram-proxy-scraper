@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from types import ModuleType
 
 from telethon import TelegramClient, events
@@ -14,13 +15,56 @@ from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import config_float
 from fetch_mtproto.mtproto.ping import PingResult, check_and_reorganize, patch_telethon_faketls
 from fetch_mtproto.mtproto.store import MTProtoProxy, ProxyCatalog
-from fetch_mtproto.scraper.client import connect_via_proxy
+from fetch_mtproto.scraper.client import (
+    connect_via_proxy,
+    fastest_working_proxy,
+    switch_to_proxy,
+)
 from fetch_mtproto.scraper.ingest import ingest_message
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
 from fetch_mtproto.v2ray.settings import ingest_subscription_kwargs, v2ray_test_kwargs
 from fetch_mtproto.v2ray.store import V2RayCatalog
 
 log = logging.getLogger("mtproto-scraper")
+
+
+@dataclass
+class ConnectionState:
+    """Shared Telegram client state for periodic proxy switching."""
+
+    client: TelegramClient | None = None
+    current_proxy: MTProtoProxy | None = None
+    pending_fastest: MTProtoProxy | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+async def _request_fastest_proxy_switch(
+    config: ModuleType,
+    mt_catalog: ProxyCatalog,
+    conn_state: ConnectionState,
+) -> None:
+    """Schedule a reconnect to the fastest working proxy after a periodic check."""
+    fastest = fastest_working_proxy(mt_catalog, config)
+    if fastest is None:
+        return
+
+    async with conn_state.lock:
+        current = conn_state.current_proxy
+        if current is not None and fastest.key == current.key:
+            log.info("Already on fastest proxy: %s", fastest.to_link())
+            return
+        log.info(
+            "Scheduled switch to fastest proxy after check: %s",
+            fastest.to_link(),
+        )
+        conn_state.pending_fastest = fastest
+        client = conn_state.client
+
+    if client is not None and client.is_connected():
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
 async def scrape_source(
@@ -128,6 +172,7 @@ async def watch_with_reconnect(
     mt_catalog: ProxyCatalog,
     v2_catalog: V2RayCatalog,
     catalog_lock: asyncio.Lock,
+    conn_state: ConnectionState,
     *,
     ingest_kwargs: dict | None = None,
 ) -> TelegramClient:
@@ -139,6 +184,9 @@ async def watch_with_reconnect(
         log.error("No watchable sources — exiting.")
         return client
 
+    conn_state.client = client
+    conn_state.current_proxy = current_proxy
+
     while True:
         try:
             await watch_sources(
@@ -146,6 +194,47 @@ async def watch_with_reconnect(
             )
         except asyncio.CancelledError:
             raise
+
+        pending: MTProtoProxy | None = None
+        async with conn_state.lock:
+            pending = conn_state.pending_fastest
+            conn_state.pending_fastest = None
+
+        if pending is not None:
+            log.info("Switching to fastest proxy from scheduled check…")
+            try:
+                client, current_proxy = await switch_to_proxy(
+                    config, pending, old_client=client
+                )
+            except Exception as exc:
+                log.error(
+                    "Switch to fastest proxy failed: %s — trying another proxy",
+                    exc,
+                )
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                client, current_proxy = await connect_via_proxy(
+                    config, mt_catalog, exclude_keys=exclude_keys
+                )
+
+            conn_state.client = client
+            conn_state.current_proxy = current_proxy
+            entities = await resolve_sources(client, sources)
+            if entities:
+                continue
+
+            log.error(
+                "No watchable sources after proxy switch — retrying in %.0f seconds",
+                delay,
+            )
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            continue
 
         log.warning("Telegram connection lost — switching proxy…")
 
@@ -184,6 +273,8 @@ async def watch_with_reconnect(
                 await asyncio.sleep(delay)
                 continue
 
+            conn_state.client = client
+            conn_state.current_proxy = current_proxy
             entities = await resolve_sources(client, sources)
             if entities:
                 break
@@ -204,6 +295,7 @@ async def periodic_checks(
     mt_catalog: ProxyCatalog,
     v2_catalog: V2RayCatalog,
     catalog_lock: asyncio.Lock,
+    conn_state: ConnectionState,
     interval: float,
 ) -> None:
     while True:
@@ -300,6 +392,9 @@ async def periodic_checks(
             raise
         except Exception as exc:
             log.error("Scheduled check failed: %s", exc)
+            continue
+
+        await _request_fastest_proxy_switch(config, mt_catalog, conn_state)
 
 
 async def ensure_authorized(client: TelegramClient) -> None:
@@ -341,6 +436,7 @@ async def run_scraper(config: ModuleType) -> None:
     )
 
     client, current_proxy = await connect_via_proxy(config, mt_catalog)
+    conn_state = ConnectionState(client=client, current_proxy=current_proxy)
     check_task: asyncio.Task | None = None
     try:
         await ensure_authorized(client)
@@ -387,7 +483,7 @@ async def run_scraper(config: ModuleType) -> None:
         if interval > 0:
             check_task = asyncio.create_task(
                 periodic_checks(
-                    config, mt_catalog, v2_catalog, catalog_lock, interval
+                    config, mt_catalog, v2_catalog, catalog_lock, conn_state, interval
                 )
             )
             log.info("Proxy / V2Ray re-check scheduled every %.0f seconds", interval)
@@ -400,6 +496,7 @@ async def run_scraper(config: ModuleType) -> None:
             mt_catalog,
             v2_catalog,
             catalog_lock,
+            conn_state,
             ingest_kwargs=ingest_kwargs,
         )
     finally:

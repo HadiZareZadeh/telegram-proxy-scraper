@@ -114,6 +114,47 @@ def _proxy_candidates(
     return candidates
 
 
+def fastest_working_proxy(
+    catalog: ProxyCatalog,
+    config: ModuleType,
+) -> MTProtoProxy | None:
+    """Return the lowest-latency working proxy from the catalog."""
+    working = catalog.working.all()
+    max_working = resolve_max_working(getattr(config, "MTPROTO_MAX_WORKING", 0))
+    if max_working is not None:
+        working = working[:max_working]
+    return working[0] if working else None
+
+
+async def switch_to_proxy(
+    config: ModuleType,
+    proxy: MTProtoProxy,
+    *,
+    old_client: TelegramClient | None = None,
+) -> tuple[TelegramClient, MTProtoProxy]:
+    """Disconnect the old client and connect via a specific proxy."""
+    timeout = config_float(getattr(config, "PING_TIMEOUT", None), 8.0)
+    if old_client is not None:
+        try:
+            await old_client.disconnect()
+        except Exception:
+            pass
+
+    log.info("Switching to fastest proxy: %s", proxy.to_link())
+    client = make_client(config, config.SESSION_NAME, proxy=proxy)
+    ok, err = await try_connect(
+        client, f"proxy {proxy.server}:{proxy.port}", timeout=timeout
+    )
+    if not ok:
+        if isinstance(err, AuthKeyDuplicatedError):
+            raise RuntimeError(
+                "Telegram session invalidated (used from two IPs at once). "
+                f"Delete sessions/{config.SESSION_NAME}.session and log in again."
+            ) from err
+        raise RuntimeError(f"Failed to connect via {proxy.to_link()}")
+    return client, proxy
+
+
 async def connect_via_proxy(
     config: ModuleType,
     catalog: ProxyCatalog,
