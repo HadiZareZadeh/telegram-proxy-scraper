@@ -3,3 +3,4 @@ python-socks[asyncio]>=2.4.0
 TelethonFakeTLS>=2022.4.4
 cryptography>=41.0.0
 PyYAML>=6.0.0
+qrcode[pil]>=7.4.0

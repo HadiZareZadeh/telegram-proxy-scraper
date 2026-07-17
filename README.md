@@ -69,7 +69,7 @@ The control panel provides:
 | Start Scraper | Connects to Telegram, scans sources, watches for new posts (login prompts answered in the input box) |
 | Ping MTProto | Tests all MTProto proxies and reorganizes working/failed in the DB |
 | Ping V2Ray | Tests all V2Ray servers through Xray and reorganizes the DB |
-| Start Subscription server | Rebuilds `data/subscription.txt` and serves it at `http://127.0.0.1:8765/subscription.txt` for NekoRay |
+| Start Subscription server | Rebuilds `data/subscription.txt` and serves it on your LAN (default `http://<your-ip>:8765/subscription.txt`). A QR code appears in the panel for easy import on phones. |
 | Open top N proxies | Opens the fastest working MTProto links in Telegram Desktop |
 
 Output of every task streams into the log pane. The status bar shows working/total counts for both catalogs.

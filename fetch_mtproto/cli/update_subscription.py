@@ -8,17 +8,23 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import load_config
+from fetch_mtproto.subscription_server import (
+    print_subscription_urls,
+    resolve_server_settings,
+)
 
 
 def main() -> None:
+    config = load_config(required=False)
+    default_host, default_port = resolve_server_settings(config)
+
     parser = argparse.ArgumentParser(
         description="Export working V2Ray links to subscription.txt and serve it locally."
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--host", default=default_host)
+    parser.add_argument("--port", type=int, default=default_port)
     args = parser.parse_args()
 
-    config = load_config(required=False)
     db, _mt, catalog = open_catalogs(config)
     try:
         count = catalog.update_subscription()
@@ -27,10 +33,8 @@ def main() -> None:
 
         handler = partial(SimpleHTTPRequestHandler, directory=str(output.parent))
         server = ThreadingHTTPServer((args.host, args.port), handler)
-        display_host = "127.0.0.1" if args.host in {"0.0.0.0", "::"} else args.host
-        print(
-            f"NekoRay subscription URL: "
-            f"http://{display_host}:{args.port}/{output.name}"
+        print_subscription_urls(
+            bind_host=args.host, port=args.port, filename=output.name
         )
         print("Keep this process running while NekoRay updates the subscription.")
         try:

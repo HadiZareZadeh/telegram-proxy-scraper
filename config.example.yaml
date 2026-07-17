@@ -19,6 +19,11 @@ storage:
   database_file: data/catalog.db
   subscription_file: data/subscription.txt
 
+subscription_server:
+  # 0.0.0.0 = reachable from other devices on your LAN (phones, tablets, etc.)
+  host: 0.0.0.0
+  port: 8765
+
 xray:
   # null = auto-detect PATH, then xray/xray.exe or xray/xray
   bin: null

@@ -68,6 +68,8 @@ class App:
         self.buttons: dict[str, ttk.Button] = {}
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.active_stdin: str | None = None
+        self._subscription_urls: list[tuple[str, str]] = []
+        self._qr_photo = None
 
         self._build_ui()
         self.root.after(100, self._drain_log_queue)
@@ -129,6 +131,41 @@ class App:
         self.status_var = tk.StringVar(value="Status: loading…")
         status_label = ttk.Label(proxies_frame, textvariable=self.status_var)
         status_label.pack(side="right", padx=12)
+
+        self.sub_frame = ttk.LabelFrame(
+            self.root, text="Subscription link", padding=8
+        )
+        sub_content = ttk.Frame(self.sub_frame)
+        sub_content.pack(fill="x")
+
+        sub_left = ttk.Frame(sub_content)
+        sub_left.pack(side="left", fill="both", expand=True)
+        ttk.Label(
+            sub_left,
+            text="Scan the QR code or copy a URL into NekoRay / v2rayNG:",
+        ).pack(anchor="w")
+        self.sub_urls_box = tk.Text(
+            sub_left,
+            height=3,
+            wrap="word",
+            font=("Consolas", 9),
+            state="disabled",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self.sub_urls_box.pack(fill="x", pady=(4, 6))
+        ttk.Button(
+            sub_left, text="Copy LAN URL", command=self._copy_subscription_url
+        ).pack(anchor="w")
+
+        self.qr_label = ttk.Label(sub_content)
+        self.qr_label.pack(side="right", padx=(12, 0))
+        self.qr_missing_label = ttk.Label(
+            sub_content,
+            text="Install qrcode[pil] to show QR",
+            foreground="gray",
+        )
 
         self.log_wrap = tk.BooleanVar(value=True)
         self.log_autoscroll = tk.BooleanVar(value=True)
@@ -389,6 +426,19 @@ class App:
     def start_job(self, key: str) -> None:
         spec = self.JOBS[key]
         args = [sys.executable, "-u", "-m", spec["module"]]
+        if key == "serve":
+            from fetch_mtproto.catalogs import subscription_path
+            from fetch_mtproto.config_loader import load_config
+            from fetch_mtproto.subscription_server import resolve_server_settings
+
+            config = load_config(required=False)
+            host, port = resolve_server_settings(config)
+            args.extend(["--host", host, "--port", str(port)])
+            filename = subscription_path(config).name
+            self.root.after(
+                0,
+                lambda: self._show_subscription_panel(host, port, filename),
+            )
         # Force the child to emit UTF-8 so Persian / non-ASCII logs render
         # correctly instead of falling back to \uXXXX escapes on Windows.
         child_env = dict(os.environ)
@@ -457,6 +507,8 @@ class App:
 
     def _job_finished(self, key: str) -> None:
         spec = self.JOBS[key]
+        if key == "serve":
+            self._hide_subscription_panel()
         if spec["long_running"]:
             self.buttons[key].configure(text=f"Start {spec['label']}")
         if self.active_stdin == key:
@@ -468,6 +520,8 @@ class App:
         if job is None or not job.running:
             return
         spec = self.JOBS[key]
+        if key == "serve":
+            self._hide_subscription_panel()
         self.log_line(f"[{spec['label']}] stopping…")
         assert job.process is not None
         kill_process_tree(job.process)
@@ -490,6 +544,66 @@ class App:
             self.log_line(f"[input → {self.JOBS[key]['label']}] {text}")
         except OSError as exc:
             self.log_line(f"[input] failed: {exc}")
+
+    # ------------------------------------------------------- subscription
+
+    def _show_subscription_panel(
+        self, bind_host: str, port: int, filename: str
+    ) -> None:
+        from fetch_mtproto.subscription_server import (
+            make_qr_photoimage,
+            primary_subscription_url,
+            subscription_urls,
+        )
+
+        self._subscription_urls = subscription_urls(
+            bind_host=bind_host, port=port, filename=filename
+        )
+        lines = [f"{label}: {url}" for label, url in self._subscription_urls]
+        self.sub_urls_box.configure(state="normal")
+        self.sub_urls_box.delete("1.0", "end")
+        self.sub_urls_box.insert("1.0", "\n".join(lines))
+        self.sub_urls_box.configure(state="disabled")
+
+        primary = primary_subscription_url(
+            bind_host=bind_host, port=port, filename=filename
+        )
+        self._qr_photo = make_qr_photoimage(primary)
+        if self._qr_photo is not None:
+            self.qr_missing_label.pack_forget()
+            self.qr_label.configure(image=self._qr_photo)
+            self.qr_label.pack(side="right", padx=(12, 0))
+        else:
+            self.qr_label.pack_forget()
+            self.qr_missing_label.pack(side="right", padx=(12, 0))
+
+        if not self.sub_frame.winfo_ismapped():
+            self.sub_frame.pack(fill="x", padx=8, pady=(0, 4), before=self.log)
+
+    def _hide_subscription_panel(self) -> None:
+        self.sub_frame.pack_forget()
+        self.qr_label.configure(image="")
+        self.qr_missing_label.pack_forget()
+        self._qr_photo = None
+        self._subscription_urls = []
+        self.sub_urls_box.configure(state="normal")
+        self.sub_urls_box.delete("1.0", "end")
+        self.sub_urls_box.configure(state="disabled")
+
+    def _copy_subscription_url(self) -> None:
+        if not self._subscription_urls:
+            return
+        # Reconstruct primary from stored URLs (LAN preferred).
+        for label, url in self._subscription_urls:
+            if label == "LAN":
+                self.root.clipboard_clear()
+                self.root.clipboard_append(url)
+                self.log_line(f"[subscription] copied LAN URL: {url}")
+                return
+        _, url = self._subscription_urls[0]
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self.log_line(f"[subscription] copied URL: {url}")
 
     # ------------------------------------------------------------- actions
 

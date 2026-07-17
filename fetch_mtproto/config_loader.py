@@ -20,6 +20,8 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("telegram", "messages_per_source", "MESSAGES_PER_SOURCE"),
     ("storage", "database_file", "DATABASE_FILE"),
     ("storage", "subscription_file", "SUBSCRIPTION_FILE"),
+    ("subscription_server", "host", "SUBSCRIPTION_SERVER_HOST"),
+    ("subscription_server", "port", "SUBSCRIPTION_SERVER_PORT"),
     ("storage", "proxies_file", "PROXIES_FILE"),
     ("storage", "failed_proxies_file", "FAILED_PROXIES_FILE"),
     ("storage", "v2ray_dir", "V2RAY_DIR"),
