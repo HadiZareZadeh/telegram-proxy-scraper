@@ -38,7 +38,7 @@ v2ray:
   test_timeout: 8.0
   ping_concurrency: 20
   # Stop probing once this many working servers are found (0 = unlimited)
-  max_working: 0
+  max_working: 300
   # Fastest, most recently checked working servers exported to subscription.txt (0 = unlimited)
   subscription_limit: 100
   # Expand HTTP subscription URLs and inline Base64 blobs into individual share links
@@ -59,7 +59,7 @@ mtproto:
   ping_concurrency: 100
   ping_timeout: 8.0
   # Stop probing once this many working proxies are found; keeps fastest by latency (0 = unlimited)
-  max_working: 0
+  max_working: 1000
 
 probe:
   # Adaptive probe scheduler (explore / exploit / recover)
