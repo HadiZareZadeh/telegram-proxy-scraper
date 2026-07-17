@@ -42,6 +42,7 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("v2ray", "subscription_fetch_timeout", "V2RAY_SUBSCRIPTION_FETCH_TIMEOUT"),
     ("v2ray", "subscription_max_urls_per_message", "V2RAY_SUBSCRIPTION_MAX_URLS"),
     ("v2ray", "parse_napsternet_attachments", "V2RAY_PARSE_NAPSTERNET_ATTACHMENTS"),
+    ("v2ray", "decrypt_npvt_attachments", "V2RAY_DECRYPT_NPVT_ATTACHMENTS"),
     ("probe", "respect_backoff", "PROBE_RESPECT_BACKOFF"),
 )
 

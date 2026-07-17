@@ -1,4 +1,4 @@
-"""Extract V2Ray share links from non-encrypted Napsternet / NPV Tunnel config files."""
+"""Extract V2Ray share links from Napsternet / NPV Tunnel config files."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import logging
 import re
 from pathlib import Path
 
+from fetch_mtproto.v2ray.npv_decrypt import decrypt_npvt_config
 from fetch_mtproto.v2ray.store import (
     V2RayServer,
     extract_v2ray_from_text,
@@ -20,6 +21,7 @@ log = logging.getLogger("mtproto-scraper")
 NAPSTERNET_EXTENSIONS = frozenset({".npv4", ".npv", ".npv2", ".npvt", ".inpv"})
 _ENCRYPTED_HEADERS = ("NPVT1", "NPVTSUB1")
 _MAX_FILE_BYTES = 2_000_000
+_SKIP_OUTBOUND_TAGS = frozenset({"direct", "block", "dns-out", "dns"})
 _BINARY_LINK_RE = re.compile(
     rb"(?P<link>(?:vmess|vless|trojan|ss|ssr|hysteria|hysteria2|tuic|wireguard)://[^\x00-\x20\"'<>]+)",
     re.IGNORECASE,
@@ -56,22 +58,70 @@ def _decode_text_blobs(data: bytes) -> list[str]:
     return texts
 
 
+def _json_object_from_text(text: str) -> dict | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def _json_chunks_from_text(text: str) -> list[object]:
     chunks: list[object] = []
+    root = _json_object_from_text(text)
+    if root is not None:
+        chunks.append(root)
     stripped = text.strip()
     if not stripped:
         return chunks
     try:
-        chunks.append(json.loads(stripped))
+        obj = json.loads(stripped)
+        if obj not in chunks:
+            chunks.append(obj)
     except json.JSONDecodeError:
         pass
-    for match in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL):
-        snippet = match.group(0)
-        try:
-            chunks.append(json.loads(snippet))
-        except json.JSONDecodeError:
-            continue
     return chunks
+
+
+_NON_V2RAY_PROFILE_TYPES = frozenset({"SSH", "HTTP", "PSIPHON"})
+
+
+def _servers_from_napsternet_profile(profile: dict) -> list[V2RayServer]:
+    """Extract V2Ray servers from a decrypted Napsternet profile object."""
+    config_type = str(profile.get("type") or "").upper()
+    has_v2_profile = isinstance(profile.get("v2rayProfile"), dict)
+    if config_type in _NON_V2RAY_PROFILE_TYPES and not has_v2_profile:
+        return []
+
+    found: list[V2RayServer] = []
+    found.extend(_servers_from_json_tree(profile))
+
+    v2_profile = profile.get("v2rayProfile")
+    if isinstance(v2_profile, dict):
+        raw_json = v2_profile.get("v2rayJson")
+        if isinstance(raw_json, str) and raw_json.strip():
+            try:
+                xray_cfg = json.loads(raw_json)
+            except json.JSONDecodeError:
+                xray_cfg = None
+            if xray_cfg is not None:
+                found.extend(_servers_from_json_tree(xray_cfg))
+    return found
+
+
+def _extract_plaintext(data: bytes) -> list[V2RayServer]:
+    found: list[V2RayServer] = []
+    for text in _decode_text_blobs(data):
+        found.extend(extract_v2ray_from_text(text))
+        found.extend(expand_subscription_payload(text))
+        for obj in _json_chunks_from_text(text):
+            found.extend(_servers_from_json_tree(obj))
+    found.extend(_servers_from_binary_scan(data))
+    return found
 
 
 def _walk_json_strings(obj: object, sink: list[str]) -> None:
@@ -258,7 +308,7 @@ def _servers_from_xray_json(config: object) -> list[V2RayServer]:
         if not isinstance(outbound, dict):
             continue
         tag = str(outbound.get("tag") or "").lower()
-        if tag in {"direct", "block", "dns-out"}:
+        if tag in _SKIP_OUTBOUND_TAGS:
             continue
         protocol = str(outbound.get("protocol") or "").lower()
         link: str | None = None
@@ -309,24 +359,32 @@ def extract_v2ray_from_napsternet_file(
     data: bytes,
     *,
     filename: str = "",
+    decrypt_npvt: bool = True,
 ) -> list[V2RayServer]:
-    """Parse a non-encrypted Napsternet file into individual V2Ray servers."""
+    """Parse Napsternet / NPV Tunnel attachments into individual V2Ray servers."""
     if not data:
         return []
     if len(data) > _MAX_FILE_BYTES:
         log.debug("Napsternet file too large (%s)", filename or "attachment")
         return []
-    if is_encrypted_napsternet(data):
-        log.debug("Skipping encrypted Napsternet file %s", filename or "attachment")
-        return []
 
     found: list[V2RayServer] = []
 
-    for text in _decode_text_blobs(data):
-        found.extend(extract_v2ray_from_text(text))
-        found.extend(expand_subscription_payload(text))
-        for obj in _json_chunks_from_text(text):
-            found.extend(_servers_from_json_tree(obj))
+    if is_encrypted_napsternet(data):
+        if not decrypt_npvt:
+            log.debug("Skipping encrypted Napsternet file %s", filename or "attachment")
+            return []
+        profile = decrypt_npvt_config(data)
+        if profile is None:
+            log.debug("Failed to decrypt Napsternet file %s", filename or "attachment")
+            return []
+        found.extend(_servers_from_napsternet_profile(profile))
+        if not found:
+            log.debug(
+                "Decrypted Napsternet file %s has no V2Ray servers",
+                filename or "attachment",
+            )
+        return _merge(found)
 
-    found.extend(_servers_from_binary_scan(data))
+    found.extend(_extract_plaintext(data))
     return _merge(found)

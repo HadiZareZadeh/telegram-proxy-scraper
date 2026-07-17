@@ -57,6 +57,7 @@ async def ingest_message(
     subscription_fetch_timeout: float = 15.0,
     subscription_max_urls: int = 5,
     parse_napsternet_attachments: bool = True,
+    decrypt_npvt_attachments: bool = True,
 ) -> tuple[int, int]:
     blob = "\n".join(message_text_parts(message))
     where = f" ({label})" if label else ""
@@ -87,7 +88,11 @@ async def ingest_message(
     from_napsternet: list[V2RayServer] = []
     if parse_napsternet_attachments and client is not None:
         for filename, raw in await download_napsternet_attachments(client, message):
-            servers = extract_v2ray_from_napsternet_file(raw, filename=filename)
+            servers = extract_v2ray_from_napsternet_file(
+                raw,
+                filename=filename,
+                decrypt_npvt=decrypt_npvt_attachments,
+            )
             if servers:
                 from_napsternet.extend(servers)
                 log.info(
