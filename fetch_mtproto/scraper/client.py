@@ -7,6 +7,7 @@ import logging
 from types import ModuleType
 
 from telethon import TelegramClient, connection
+from telethon.errors import AuthKeyDuplicatedError
 from telethon.tl.functions.help import GetConfigRequest
 
 from fetch_mtproto.config_loader import config_float, resolve_max_working
@@ -62,21 +63,21 @@ async def _probe_telegram(client: TelegramClient, timeout: float) -> None:
 
 async def try_connect(
     client: TelegramClient, label: str, *, timeout: float
-) -> bool:
+) -> tuple[bool, BaseException | None]:
     try:
         await client.connect()
         if not client.is_connected():
-            return False
+            return False, None
         await _probe_telegram(client, timeout)
         log.info("Connected via %s", label)
-        return True
+        return True, None
     except Exception as exc:
-        log.debug("Connect via %s failed: %s", label, exc)
+        log.warning("Connect via %s failed: %s", label, exc)
         try:
             await client.disconnect()
         except Exception:
             pass
-        return False
+        return False, exc
 
 
 async def connect_direct(config: ModuleType) -> TelegramClient:
@@ -84,7 +85,8 @@ async def connect_direct(config: ModuleType) -> TelegramClient:
     log.info("Connecting without proxy…")
     timeout = config_float(getattr(config, "PING_TIMEOUT", None), 8.0)
     client = make_client(config, config.SESSION_NAME, proxy=None)
-    if not await try_connect(client, "direct (no proxy)", timeout=timeout):
+    ok, _err = await try_connect(client, "direct (no proxy)", timeout=timeout)
+    if not ok:
         raise RuntimeError(
             "Direct connection failed. Check your network, or add working "
             "tg://proxy?... links (they are stored in data/catalog.db)."
@@ -167,9 +169,15 @@ async def connect_via_proxy(
     log.info("Using first working proxy (%.0f ms): %s", latency * 1000, proxy.to_link())
 
     client = make_client(config, config.SESSION_NAME, proxy=proxy)
-    if not await try_connect(
+    ok, err = await try_connect(
         client, f"proxy {proxy.server}:{proxy.port}", timeout=timeout
-    ):
+    )
+    if not ok:
+        if isinstance(err, AuthKeyDuplicatedError):
+            raise RuntimeError(
+                "Telegram session invalidated (used from two IPs at once). "
+                f"Delete sessions/{config.SESSION_NAME}.session and log in again."
+            ) from err
         log.warning("Chosen proxy failed to connect — trying direct.")
         return await connect_direct(config), None
     return client, proxy
