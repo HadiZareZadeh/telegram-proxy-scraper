@@ -9,6 +9,13 @@ import sys
 import time
 
 
+def hide_console_kwargs() -> dict:
+    """Extra subprocess kwargs to avoid flashing console windows on Windows."""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
 def kill_process_tree(
     process: subprocess.Popen,
     *,
@@ -38,6 +45,7 @@ def _kill_tree_windows(pid: int) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
+        **hide_console_kwargs(),
     )
 
 

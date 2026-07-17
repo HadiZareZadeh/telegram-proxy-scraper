@@ -8,6 +8,8 @@ import re
 import subprocess
 from typing import TYPE_CHECKING
 
+from fetch_mtproto.process_tree import hide_console_kwargs
+
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8765
 
@@ -96,6 +98,7 @@ def _windows_ipconfig_candidates() -> list[tuple[str, str, str | None, bool]]:
             errors="replace",
             timeout=5,
             check=False,
+            **hide_console_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return []

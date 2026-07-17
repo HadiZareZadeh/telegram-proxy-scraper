@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from fetch_mtproto.paths import LOGS_DIR, PROJECT_ROOT
-from fetch_mtproto.process_tree import kill_process_tree
+from fetch_mtproto.process_tree import hide_console_kwargs, kill_process_tree
 
 TELEGRAM_EXE = os.path.join(
     os.environ.get("APPDATA", ""), "Telegram Desktop", "Telegram.exe"
@@ -453,10 +453,9 @@ class App:
             "encoding": "utf-8",
             "errors": "replace",
             "env": child_env,
+            **hide_console_kwargs(),
         }
-        if sys.platform == "win32":
-            popen_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        else:
+        if sys.platform != "win32":
             # Isolate CLI jobs in their own process group so tree kill is safe.
             popen_kw["start_new_session"] = True
         try:
@@ -652,7 +651,7 @@ class App:
             self.log_line(f"[proxies] [{i}/{len(proxies)}] {link}")
             try:
                 if use_exe:
-                    subprocess.Popen([TELEGRAM_EXE, "--", link])
+                    subprocess.Popen([TELEGRAM_EXE, "--", link], **hide_console_kwargs())
                 else:
                     os.startfile(link)  # tg:// handler
             except OSError as exc:

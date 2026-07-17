@@ -6,8 +6,6 @@ import asyncio
 import os
 import shutil
 import socket
-import subprocess
-import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -17,6 +15,7 @@ from urllib.parse import urlparse
 from python_socks.async_.asyncio import Proxy
 
 from fetch_mtproto.paths import PROJECT_ROOT, XRAY_DIR
+from fetch_mtproto.process_tree import hide_console_kwargs
 from fetch_mtproto.v2ray.store import V2RayCatalog, V2RayServer
 from fetch_mtproto.v2ray.xray import build_xray_config, dumps_config, link_to_xray_outbound
 
@@ -202,10 +201,6 @@ async def ping_v2ray(
             handle.write(dumps_config(config))
             cfg_path = handle.name
 
-        proc_kw: dict = {}
-        if sys.platform == "win32":
-            proc_kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
         proc = await asyncio.create_subprocess_exec(
             bin_path,
             "run",
@@ -213,7 +208,7 @@ async def ping_v2ray(
             cfg_path,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            **proc_kw,
+            **hide_console_kwargs(),
         )
         await _wait_port("127.0.0.1", socks_port, timeout=min(8.0, timeout))
         latency, nbytes = await _ping_via_socks(
