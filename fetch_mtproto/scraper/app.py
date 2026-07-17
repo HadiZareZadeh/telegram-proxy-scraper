@@ -17,7 +17,7 @@ from fetch_mtproto.mtproto.store import MTProtoProxy, ProxyCatalog
 from fetch_mtproto.scraper.client import connect_via_proxy
 from fetch_mtproto.scraper.ingest import ingest_message
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
-from fetch_mtproto.v2ray.settings import v2ray_test_kwargs
+from fetch_mtproto.v2ray.settings import ingest_subscription_kwargs, v2ray_test_kwargs
 from fetch_mtproto.v2ray.store import V2RayCatalog
 
 log = logging.getLogger("mtproto-scraper")
@@ -29,6 +29,8 @@ async def scrape_source(
     limit: int | None,
     mt_catalog: ProxyCatalog,
     v2_catalog: V2RayCatalog,
+    *,
+    ingest_kwargs: dict | None = None,
 ) -> tuple[int, int]:
     mt_total = 0
     v2_total = 0
@@ -50,7 +52,9 @@ async def scrape_source(
         scanned += 1
         if not isinstance(message, Message):
             continue
-        mt_n, v2_n = ingest_message(message, mt_catalog, v2_catalog, label=str(title))
+        mt_n, v2_n = await ingest_message(
+            message, mt_catalog, v2_catalog, label=str(title), **(ingest_kwargs or {})
+        )
         mt_total += mt_n
         v2_total += v2_n
 
@@ -84,6 +88,8 @@ async def watch_sources(
     mt_catalog: ProxyCatalog,
     v2_catalog: V2RayCatalog,
     catalog_lock: asyncio.Lock,
+    *,
+    ingest_kwargs: dict | None = None,
 ) -> None:
     @client.on(events.NewMessage(chats=entities))
     async def on_new_message(event: events.NewMessage.Event) -> None:
@@ -93,7 +99,13 @@ async def watch_sources(
         chat = await event.get_chat()
         label = getattr(chat, "title", None) or getattr(chat, "username", None) or event.chat_id
         async with catalog_lock:
-            ingest_message(message, mt_catalog, v2_catalog, label=str(label))
+            await ingest_message(
+                message,
+                mt_catalog,
+                v2_catalog,
+                label=str(label),
+                **(ingest_kwargs or {}),
+            )
 
     log.info(
         "Listening for new messages in %d source(s) — Ctrl+C to stop",
@@ -110,6 +122,8 @@ async def watch_with_reconnect(
     mt_catalog: ProxyCatalog,
     v2_catalog: V2RayCatalog,
     catalog_lock: asyncio.Lock,
+    *,
+    ingest_kwargs: dict | None = None,
 ) -> TelegramClient:
     """Listen for new messages; reconnect via another proxy when the link drops."""
     delay = config_float(getattr(config, "RECONNECT_DELAY", None), 5.0)
@@ -121,7 +135,9 @@ async def watch_with_reconnect(
 
     while True:
         try:
-            await watch_sources(client, entities, mt_catalog, v2_catalog, catalog_lock)
+            await watch_sources(
+                client, entities, mt_catalog, v2_catalog, catalog_lock, ingest_kwargs=ingest_kwargs
+            )
         except asyncio.CancelledError:
             raise
 
@@ -329,11 +345,17 @@ async def run_scraper(config: ModuleType) -> None:
             return
 
         limit = getattr(config, "MESSAGES_PER_SOURCE", 500)
+        ingest_kwargs = ingest_subscription_kwargs(config)
         mt_new = 0
         v2_new = 0
         for source in sources:
             mt_n, v2_n = await scrape_source(
-                client, source, limit, mt_catalog, v2_catalog
+                client,
+                source,
+                limit,
+                mt_catalog,
+                v2_catalog,
+                ingest_kwargs=ingest_kwargs,
             )
             mt_new += mt_n
             v2_new += v2_n
@@ -372,6 +394,7 @@ async def run_scraper(config: ModuleType) -> None:
             mt_catalog,
             v2_catalog,
             catalog_lock,
+            ingest_kwargs=ingest_kwargs,
         )
     finally:
         if check_task is not None:

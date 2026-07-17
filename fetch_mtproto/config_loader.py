@@ -38,6 +38,9 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("mtproto", "max_working", "MTPROTO_MAX_WORKING"),
     ("v2ray", "max_working", "V2RAY_MAX_WORKING"),
     ("v2ray", "subscription_limit", "V2RAY_SUBSCRIPTION_LIMIT"),
+    ("v2ray", "expand_subscriptions", "V2RAY_EXPAND_SUBSCRIPTIONS"),
+    ("v2ray", "subscription_fetch_timeout", "V2RAY_SUBSCRIPTION_FETCH_TIMEOUT"),
+    ("v2ray", "subscription_max_urls_per_message", "V2RAY_SUBSCRIPTION_MAX_URLS"),
     ("probe", "respect_backoff", "PROBE_RESPECT_BACKOFF"),
 )
 
