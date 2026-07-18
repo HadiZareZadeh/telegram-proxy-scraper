@@ -748,11 +748,23 @@ class App:
                     kill_process_tree(job.process)
         self.root.destroy()
 
+    def _schedule_auto_start_jobs(self) -> None:
+        from fetch_mtproto.config_loader import load_config
+
+        config = load_config(required=False)
+        if not config:
+            return
+        if bool(getattr(config, "GUI_AUTO_START_SCRAPER", False)):
+            self.root.after(100, lambda: self.start_job("scrape"))
+        if bool(getattr(config, "GUI_AUTO_START_SUBSCRIPTION_SERVER", False)):
+            self.root.after(200, lambda: self.start_job("serve"))
+
     def run(self) -> None:
         self.log_line("fetch-mtproto control panel ready.")
         self.log_line(
             "Scraper login: when prompted, type phone / code below and press Send."
         )
+        self._schedule_auto_start_jobs()
         self.root.mainloop()
 
 

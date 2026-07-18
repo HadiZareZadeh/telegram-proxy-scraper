@@ -67,3 +67,8 @@ probe:
   # Adaptive probe scheduler (explore / exploit / recover)
   # Skip chronic failures until their backoff window expires.
   respect_backoff: true
+
+gui:
+  # When using app.pyw, start these jobs automatically after the control panel opens
+  auto_start_scraper: false
+  auto_start_subscription_server: false

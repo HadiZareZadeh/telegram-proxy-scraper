@@ -44,6 +44,8 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("v2ray", "parse_napsternet_attachments", "V2RAY_PARSE_NAPSTERNET_ATTACHMENTS"),
     ("v2ray", "decrypt_npvt_attachments", "V2RAY_DECRYPT_NPVT_ATTACHMENTS"),
     ("probe", "respect_backoff", "PROBE_RESPECT_BACKOFF"),
+    ("gui", "auto_start_scraper", "GUI_AUTO_START_SCRAPER"),
+    ("gui", "auto_start_subscription_server", "GUI_AUTO_START_SUBSCRIPTION_SERVER"),
 )
 
 
