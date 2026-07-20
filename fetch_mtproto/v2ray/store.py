@@ -433,6 +433,11 @@ class V2RayCatalog:
         servers = [_server_from_row(row) for row in rows]
         return write_subscription(servers, self.subscription_path)
 
+    def fastest_working(self, limit: int | None = None) -> list[V2RayServer]:
+        """Working servers ordered fastest-first (same order as subscription export)."""
+        rows = self.db.v2ray_subscription_list(limit)
+        return [_server_from_row(row) for row in rows]
+
     def add(self, servers: Iterable[V2RayServer]) -> int:
         rows = [
             server.as_db_row()

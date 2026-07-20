@@ -328,5 +328,60 @@ def build_xray_config(outbound: dict[str, Any], socks_port: int) -> dict[str, An
     }
 
 
+def build_xray_tun_config(
+    outbound: dict[str, Any],
+    *,
+    tun_name: str = "xray0",
+    mtu: int = 1500,
+    tun_tag: str = "tun-in",
+) -> dict[str, Any]:
+    """Full Xray config: TUN inbound routes traffic through the given outbound."""
+    outbound = dict(outbound)
+    outbound.setdefault("tag", "proxy")
+    return {
+        "log": {"loglevel": "warning"},
+        "dns": {"servers": ["1.1.1.1", "8.8.8.8"]},
+        "inbounds": [
+            {
+                "tag": tun_tag,
+                "port": 0,
+                "protocol": "tun",
+                "settings": {
+                    "name": tun_name,
+                    "MTU": mtu,
+                    "gateway": ["172.19.0.1/30"],
+                    "DNS": ["1.1.1.1", "8.8.8.8"],
+                    "autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
+                    "autoOutboundsInterface": "auto",
+                },
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"],
+                },
+            }
+        ],
+        "outbounds": [
+            outbound,
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "block"},
+        ],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {
+                    "type": "field",
+                    "ip": ["geoip:private"],
+                    "outboundTag": "direct",
+                },
+                {
+                    "type": "field",
+                    "inboundTag": [tun_tag],
+                    "outboundTag": "proxy",
+                },
+            ],
+        },
+    }
+
+
 def dumps_config(config: dict[str, Any]) -> str:
     return json.dumps(config, ensure_ascii=False, indent=2)

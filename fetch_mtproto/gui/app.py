@@ -62,6 +62,11 @@ class App:
             "module": "fetch_mtproto.cli.update_subscription",
             "long_running": True,
         },
+        "tun": {
+            "label": "TUN VPN",
+            "module": "fetch_mtproto.cli.xray_tun",
+            "long_running": True,
+        },
     }
 
     def __init__(self) -> None:

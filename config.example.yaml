@@ -29,6 +29,12 @@ subscription_server:
 xray:
   # null = auto-detect PATH, then xray/xray.exe or xray/xray
   bin: null
+  # TUN mode (GUI "Start TUN VPN"): rotate through fastest working servers
+  tun_switch_interval: 60   # seconds between server switches
+  tun_server_limit: 20      # top N fastest servers to rotate (null = subscription_limit)
+  tun_reuse_cooldown: 900   # seconds before a previously used server can be picked again
+  tun_name: xray0           # virtual interface name
+  tun_mtu: 1500
 
 v2ray:
   # HTTP URL fetched through each V2Ray proxy (latency = TTFB). Default is an empty 204.
