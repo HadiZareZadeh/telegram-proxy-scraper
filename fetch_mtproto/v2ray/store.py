@@ -32,6 +32,13 @@ _V2RAY_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Transports Nekoray v3.26 cannot use (Xray splithttp/xhttp, raw socket).
+NEKORAY_INCOMPATIBLE_NETWORKS = frozenset({"xhttp", "splithttp", "raw"})
+_NETWORK_FROM_LINK_RE = re.compile(
+    r"(?:^|[?&])(?:type|network|obfs)=([^&\s#]+)",
+    re.IGNORECASE,
+)
+
 
 def _b64decode(data: str) -> bytes:
     raw = data.strip().replace("-", "+").replace("_", "/")
@@ -322,6 +329,20 @@ def parse_v2ray_link(link: str) -> V2RayServer | None:
         return None
 
 
+def normalized_network(server: V2RayServer) -> str:
+    net = (server.network or "").strip().lower()
+    if net:
+        return net
+    match = _NETWORK_FROM_LINK_RE.search(server.link)
+    if match:
+        return unquote(match.group(1)).strip().lower()
+    return ""
+
+
+def is_nekoray_compatible(server: V2RayServer) -> bool:
+    return normalized_network(server) not in NEKORAY_INCOMPATIBLE_NETWORKS
+
+
 def extract_v2ray_from_text(text: str) -> list[V2RayServer]:
     if not text:
         return []
@@ -418,10 +439,11 @@ class V2RayCatalog:
     ) -> list[V2RayServer]:
         """Ordered probe list: most successful / freshest / unexplored first."""
         return [
-            _server_from_row(row)
+            server
             for row in self.db.v2ray_probe_queue(
                 respect_backoff=respect_backoff, limit=limit
             )
+            if is_nekoray_compatible(server := _server_from_row(row))
         ]
 
     def counts(self) -> tuple[int, int]:
@@ -430,14 +452,18 @@ class V2RayCatalog:
     def update_subscription(self) -> int:
         """Write fastest, most recently checked working servers to the subscription export."""
         rows = self.db.v2ray_subscription_list(self.subscription_limit)
-        servers = [_server_from_row(row) for row in rows]
+        servers = [
+            server
+            for row in rows
+            if is_nekoray_compatible(server := _server_from_row(row))
+        ]
         return write_subscription(servers, self.subscription_path)
 
     def add(self, servers: Iterable[V2RayServer]) -> int:
         rows = [
             server.as_db_row()
             for server in servers
-            if server.scheme in self.working
+            if server.scheme in self.working and is_nekoray_compatible(server)
         ]
         added = self.db.v2ray_upsert_working(rows)
         if added:
