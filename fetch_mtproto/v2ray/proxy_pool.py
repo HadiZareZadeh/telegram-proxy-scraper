@@ -28,9 +28,9 @@ StatusFn = Callable[[list["ProxySlotStatus"]], None]
 FinishedFn = Callable[[], None]
 
 PORTS_PER_SLOT = 2
-# A used upstream may be picked again once either threshold is met.
-REUSE_AFTER_ROTATIONS = 5
-REUSE_AFTER_SEC = 20 * 60
+# Defaults; overridden by config.yaml proxy_pool.* when the runner is started.
+DEFAULT_REUSE_AFTER_ROTATIONS = 5
+DEFAULT_REUSE_AFTER_SEC = 20 * 60
 
 
 @dataclass(slots=True)
@@ -70,6 +70,8 @@ class ProxyPoolRunner:
         count: int,
         switch_interval_sec: float,
         xray_bin: str | None = None,
+        reuse_after_rotations: int = DEFAULT_REUSE_AFTER_ROTATIONS,
+        reuse_after_sec: float = DEFAULT_REUSE_AFTER_SEC,
         log: LogFn | None = None,
         on_status: StatusFn | None = None,
         on_finished: FinishedFn | None = None,
@@ -78,6 +80,8 @@ class ProxyPoolRunner:
         self.count = count
         self.switch_interval_sec = switch_interval_sec
         self.xray_bin = xray_bin
+        self.reuse_after_rotations = max(1, int(reuse_after_rotations))
+        self.reuse_after_sec = max(1.0, float(reuse_after_sec))
         self._log = log or (lambda _msg: None)
         self._on_status = on_status
         self._on_finished = on_finished
@@ -214,7 +218,10 @@ class ProxyPoolRunner:
             return True
         rotations_ago = rotation - record.rotation
         age_sec = now - record.used_at
-        return rotations_ago >= REUSE_AFTER_ROTATIONS or age_sec >= REUSE_AFTER_SEC
+        return (
+            rotations_ago >= self.reuse_after_rotations
+            or age_sec >= self.reuse_after_sec
+        )
 
     def _pick_servers(self, count: int) -> list[V2RayServer]:
         """Pick distinct upstreams, preferring ones off cooldown."""
@@ -320,7 +327,8 @@ class ProxyPoolRunner:
         self._log(
             f"[proxy pool] assigned {len(selected)} upstream(s); "
             f"{cooling} server(s) on cooldown "
-            f"(reuse after {REUSE_AFTER_ROTATIONS} rotations or {REUSE_AFTER_SEC // 60} min)"
+            f"(reuse after {self.reuse_after_rotations} rotations or "
+            f"{int(self.reuse_after_sec) // 60} min)"
         )
 
         for index, slot in enumerate(slots):

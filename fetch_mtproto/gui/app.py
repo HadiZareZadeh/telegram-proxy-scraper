@@ -77,8 +77,11 @@ class App:
         self._subscription_urls: list[tuple[str, str]] = []
         self._qr_photo = None
         self.proxy_pool: "ProxyPoolRunner | None" = None
+        self._config_save_after_id: str | None = None
+        self._loading_config = False
 
         self._build_ui()
+        self._load_ui_from_config()
         self.root.after(100, self._drain_log_queue)
         self.root.after(300, self.refresh_status)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -225,6 +228,7 @@ class App:
             textvariable=self.top_count,
         )
         self.top_spin.pack(side="left", padx=4)
+        self._watch_config_var(self.top_count)
         ttk.Button(
             row,
             text="proxies in Telegram",
@@ -242,7 +246,7 @@ class App:
             parent,
             text=(
                 "Run local SOCKS5 + HTTP proxy pairs (one upstream V2Ray server per slot). "
-                "Each slot uses two ports: SOCKS5 then HTTP. No config files written."
+                "Each slot uses two ports: SOCKS5 then HTTP. Settings are saved to config.yaml."
             ),
             wraplength=720,
         ).pack(anchor="w", pady=(0, 12))
@@ -279,7 +283,7 @@ class App:
         ttk.Label(form, text="Switch servers every (sec)").grid(
             row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8)
         )
-        self.pool_switch_sec = tk.IntVar(value=300)
+        self.pool_switch_sec = tk.IntVar(value=30)
         switch_spin = ttk.Spinbox(
             form,
             from_=30,
@@ -290,6 +294,43 @@ class App:
         switch_spin.grid(row=1, column=1, sticky="w", pady=(8, 0))
         self._attach_entry_menu(switch_spin)
 
+        ttk.Label(form, text="Reuse after (rotations)").grid(
+            row=1, column=2, sticky="w", padx=(24, 8), pady=(8, 0)
+        )
+        self.pool_reuse_rotations = tk.IntVar(value=5)
+        reuse_rot_spin = ttk.Spinbox(
+            form,
+            from_=1,
+            to=100,
+            width=4,
+            textvariable=self.pool_reuse_rotations,
+        )
+        reuse_rot_spin.grid(row=1, column=3, sticky="w", pady=(8, 0))
+        self._attach_entry_menu(reuse_rot_spin)
+
+        ttk.Label(form, text="Reuse after (sec)").grid(
+            row=2, column=0, sticky="w", pady=(8, 0), padx=(0, 8)
+        )
+        self.pool_reuse_sec = tk.IntVar(value=1200)
+        reuse_sec_spin = ttk.Spinbox(
+            form,
+            from_=60,
+            to=86400,
+            width=8,
+            textvariable=self.pool_reuse_sec,
+        )
+        reuse_sec_spin.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        self._attach_entry_menu(reuse_sec_spin)
+
+        for var in (
+            self.pool_start_port,
+            self.pool_count,
+            self.pool_switch_sec,
+            self.pool_reuse_rotations,
+            self.pool_reuse_sec,
+        ):
+            self._watch_config_var(var)
+
         btn_row = ttk.Frame(parent)
         btn_row.pack(fill="x", pady=(8, 12))
         self.pool_btn = ttk.Button(
@@ -299,7 +340,13 @@ class App:
             width=24,
         )
         self.pool_btn.pack(side="left")
-        self.pool_pool_inputs = (start_port_spin, count_spin, switch_spin)
+        self.pool_pool_inputs = (
+            start_port_spin,
+            count_spin,
+            switch_spin,
+            reuse_rot_spin,
+            reuse_sec_spin,
+        )
 
         status_frame = ttk.LabelFrame(parent, text="Active proxies", padding=8)
         status_frame.pack(fill="both", expand=True)
@@ -829,6 +876,103 @@ class App:
         else:
             self.start_proxy_pool()
 
+    # ----------------------------------------------------------- config I/O
+
+    def _load_ui_from_config(self) -> None:
+        from fetch_mtproto.config_loader import config_int, load_config
+
+        config = load_config(required=False)
+        if not config:
+            return
+        self._loading_config = True
+        try:
+            self.top_count.set(
+                config_int(getattr(config, "GUI_PROXY_OPEN_TOP", None), 10, minimum=1, maximum=50)
+            )
+            self.pool_start_port.set(
+                config_int(
+                    getattr(config, "PROXY_POOL_START_PORT", None),
+                    10801,
+                    minimum=1024,
+                    maximum=65000,
+                )
+            )
+            self.pool_count.set(
+                config_int(getattr(config, "PROXY_POOL_COUNT", None), 10, minimum=1, maximum=50)
+            )
+            self.pool_switch_sec.set(
+                config_int(
+                    getattr(config, "PROXY_POOL_SWITCH_INTERVAL_SEC", None),
+                    30,
+                    minimum=30,
+                    maximum=86400,
+                )
+            )
+            self.pool_reuse_rotations.set(
+                config_int(
+                    getattr(config, "PROXY_POOL_REUSE_AFTER_ROTATIONS", None),
+                    5,
+                    minimum=1,
+                    maximum=100,
+                )
+            )
+            self.pool_reuse_sec.set(
+                config_int(
+                    getattr(config, "PROXY_POOL_REUSE_AFTER_SEC", None),
+                    1200,
+                    minimum=60,
+                    maximum=86400,
+                )
+            )
+        finally:
+            self._loading_config = False
+
+    def _watch_config_var(self, var: tk.Variable) -> None:
+        var.trace_add("write", lambda *_args: self._schedule_save_ui_config())
+
+    def _schedule_save_ui_config(self) -> None:
+        if getattr(self, "_loading_config", False):
+            return
+        if self._config_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._config_save_after_id)
+            except tk.TclError:
+                pass
+        self._config_save_after_id = self.root.after(400, self._save_ui_config)
+
+    def _read_ui_config_values(self) -> dict[str, dict]:
+        def _safe_int(var: tk.IntVar, default: int) -> int:
+            try:
+                return int(var.get())
+            except (tk.TclError, TypeError, ValueError):
+                return default
+
+        return {
+            "proxy_pool": {
+                "start_port": max(1024, min(65000, _safe_int(self.pool_start_port, 10801))),
+                "count": max(1, min(50, _safe_int(self.pool_count, 10))),
+                "switch_interval_sec": max(30, min(86400, _safe_int(self.pool_switch_sec, 30))),
+                "reuse_after_rotations": max(
+                    1, min(100, _safe_int(self.pool_reuse_rotations, 5))
+                ),
+                "reuse_after_sec": max(60, min(86400, _safe_int(self.pool_reuse_sec, 1200))),
+            },
+            "gui": {
+                "proxy_open_top": max(1, min(50, _safe_int(self.top_count, 10))),
+            },
+        }
+
+    def _save_ui_config(self) -> None:
+        self._config_save_after_id = None
+        if getattr(self, "_loading_config", False):
+            return
+        from fetch_mtproto.config_loader import update_config_values
+
+        try:
+            update_config_values(self._read_ui_config_values())
+        except OSError as exc:
+            self.log_line(f"[config] failed to save config.yaml: {exc}")
+
     def start_proxy_pool(self) -> None:
         from fetch_mtproto.config_loader import load_config
         from fetch_mtproto.v2ray.ping import resolve_xray_bin
@@ -842,6 +986,8 @@ class App:
             start_port = max(1024, int(self.pool_start_port.get()))
             count = max(1, min(50, int(self.pool_count.get())))
             switch_sec = max(30, int(self.pool_switch_sec.get()))
+            reuse_rotations = max(1, int(self.pool_reuse_rotations.get()))
+            reuse_sec = max(60, int(self.pool_reuse_sec.get()))
         except tk.TclError:
             messagebox.showerror("fetch-mtproto", "Invalid proxy pool settings.")
             return
@@ -854,6 +1000,8 @@ class App:
                 f"(each slot uses SOCKS5 + HTTP on two consecutive ports).",
             )
             return
+
+        self._save_ui_config()
 
         config = load_config(required=False)
         xray_bin = resolve_xray_bin(getattr(config, "XRAY_BIN", None) if config else None)
@@ -869,6 +1017,8 @@ class App:
             count=count,
             switch_interval_sec=float(switch_sec),
             xray_bin=xray_bin,
+            reuse_after_rotations=reuse_rotations,
+            reuse_after_sec=float(reuse_sec),
             log=self.log_line,
             on_status=self._update_proxy_pool_status,
             on_finished=self._proxy_pool_finished,
@@ -1037,6 +1187,7 @@ class App:
     # ------------------------------------------------------------ shutdown
 
     def _on_close(self) -> None:
+        self._save_ui_config()
         running = [k for k, j in self.jobs.items() if j.running]
         pool_running = self.proxy_pool is not None and self.proxy_pool.running
         if running or pool_running:
@@ -1065,6 +1216,8 @@ class App:
             self.root.after(100, lambda: self.start_job("scrape"))
         if bool(getattr(config, "GUI_AUTO_START_SUBSCRIPTION_SERVER", False)):
             self.root.after(200, lambda: self.start_job("serve"))
+        if bool(getattr(config, "GUI_AUTO_START_PROXY_POOL", False)):
+            self.root.after(300, self.start_proxy_pool)
 
     def run(self) -> None:
         self.log_line("fetch-mtproto control panel ready.")

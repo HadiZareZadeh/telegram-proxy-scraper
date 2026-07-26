@@ -68,7 +68,20 @@ probe:
   # Skip chronic failures until their backoff window expires.
   respect_backoff: true
 
+proxy_pool:
+  # Local SOCKS5+HTTP slots for emulators / other tools (Proxy pool tab)
+  start_port: 10801
+  count: 10
+  # Rotate upstream V2Ray servers for every slot
+  switch_interval_sec: 30
+  # Do not reuse an upstream until either threshold is met
+  reuse_after_rotations: 5
+  reuse_after_sec: 1200
+
 gui:
   # When using app.pyw, start these jobs automatically after the control panel opens
   auto_start_scraper: false
   auto_start_subscription_server: false
+  auto_start_proxy_pool: false
+  # Proxies tab: how many MTProto links to open/copy by default
+  proxy_open_top: 10

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Mapping
 
 import yaml
 
@@ -46,7 +49,21 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("probe", "respect_backoff", "PROBE_RESPECT_BACKOFF"),
     ("gui", "auto_start_scraper", "GUI_AUTO_START_SCRAPER"),
     ("gui", "auto_start_subscription_server", "GUI_AUTO_START_SUBSCRIPTION_SERVER"),
+    ("gui", "auto_start_proxy_pool", "GUI_AUTO_START_PROXY_POOL"),
+    ("gui", "proxy_open_top", "GUI_PROXY_OPEN_TOP"),
+    ("proxy_pool", "start_port", "PROXY_POOL_START_PORT"),
+    ("proxy_pool", "count", "PROXY_POOL_COUNT"),
+    ("proxy_pool", "switch_interval_sec", "PROXY_POOL_SWITCH_INTERVAL_SEC"),
+    ("proxy_pool", "reuse_after_rotations", "PROXY_POOL_REUSE_AFTER_ROTATIONS"),
+    ("proxy_pool", "reuse_after_sec", "PROXY_POOL_REUSE_AFTER_SEC"),
 )
+
+_SECTION_RE = re.compile(r"^([A-Za-z_][\w]*)\s*:")
+_KEY_RE = re.compile(r"^(\s*)([A-Za-z_][\w]*)\s*:")
+
+
+def config_path() -> Path:
+    return _CONFIG_PATH
 
 
 def _parse_config(path: Path) -> SimpleNamespace:
@@ -74,6 +91,25 @@ def config_float(value: object, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def config_int(
+    value: object,
+    default: int,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Coerce a config value to int with optional bounds."""
+    try:
+        n = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        n = default
+    if minimum is not None:
+        n = max(minimum, n)
+    if maximum is not None:
+        n = min(maximum, n)
+    return n
 
 
 def resolve_max_working(value: object) -> int | None:
@@ -105,3 +141,99 @@ def load_config(*, required: bool = True) -> SimpleNamespace | None:
             "and fill in your values."
         )
     return None
+
+
+def _yaml_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if text == "" or any(ch in text for ch in ":#{}[]&*!|>'\"%@`"):
+        return json.dumps(text, ensure_ascii=False)
+    return text
+
+
+def update_config_values(updates: Mapping[str, Mapping[str, Any]]) -> Path:
+    """
+    Update nested keys in config.yaml while preserving comments and layout.
+
+    Example:
+        update_config_values({"proxy_pool": {"start_port": 10801, "count": 10}})
+    """
+    if not updates:
+        return _CONFIG_PATH
+
+    if _CONFIG_PATH.is_file():
+        original = _CONFIG_PATH.read_text(encoding="utf-8")
+    elif _EXAMPLE_PATH.is_file():
+        original = _EXAMPLE_PATH.read_text(encoding="utf-8")
+    else:
+        original = ""
+
+    lines = original.splitlines(keepends=True)
+    pending: dict[str, dict[str, Any]] = {
+        section: dict(values) for section, values in updates.items() if values
+    }
+    current_section: str | None = None
+    out: list[str] = []
+
+    def _flush_section_keys(section: str) -> None:
+        if section not in pending or not pending[section]:
+            return
+        for key, value in list(pending[section].items()):
+            out.append(f"  {key}: {_yaml_scalar(value)}\n")
+            del pending[section][key]
+        del pending[section]
+
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("#") and line[:1] not in " \t":
+            section_match = _SECTION_RE.match(line)
+            if section_match:
+                if current_section:
+                    _flush_section_keys(current_section)
+                current_section = section_match.group(1)
+                out.append(line)
+                continue
+
+        key_match = _KEY_RE.match(line)
+        if key_match and current_section and current_section in pending:
+            indent, key = key_match.group(1), key_match.group(2)
+            if key in pending[current_section]:
+                value = pending[current_section].pop(key)
+                comment = ""
+                hash_at = line.find("#")
+                if hash_at >= 0:
+                    before = line[:hash_at]
+                    if before.count('"') % 2 == 0 and before.count("'") % 2 == 0:
+                        comment = "  " + line[hash_at:].rstrip("\r\n")
+                if line.endswith("\r\n"):
+                    newline = "\r\n"
+                elif line.endswith("\n"):
+                    newline = "\n"
+                else:
+                    newline = "\n"
+                out.append(f"{indent}{key}: {_yaml_scalar(value)}{comment}{newline}")
+                if not pending[current_section]:
+                    del pending[current_section]
+                continue
+
+        out.append(line)
+
+    if current_section:
+        _flush_section_keys(current_section)
+
+    for section, values in pending.items():
+        if not values:
+            continue
+        if out and out[-1].strip():
+            out.append("\n")
+        out.append(f"{section}:\n")
+        for key, value in values.items():
+            out.append(f"  {key}: {_yaml_scalar(value)}\n")
+
+    _CONFIG_PATH.write_text("".join(out), encoding="utf-8")
+    return _CONFIG_PATH
