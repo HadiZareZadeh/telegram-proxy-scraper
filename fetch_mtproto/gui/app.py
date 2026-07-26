@@ -150,6 +150,15 @@ class App:
             text="Start or stop background tasks. Output appears in the log below.",
         ).pack(anchor="w", pady=(0, 12))
 
+        self.auto_start_scraper = tk.BooleanVar(value=False)
+        auto_scrape = ttk.Checkbutton(
+            parent,
+            text="Auto-start scraper when the control panel opens",
+            variable=self.auto_start_scraper,
+        )
+        auto_scrape.pack(anchor="w", pady=(0, 12))
+        self._watch_config_var(self.auto_start_scraper)
+
         job_keys = ("scrape", "ping_mtproto", "ping_v2ray")
         job_hints = {
             "scrape": "Collect MTProto / V2Ray proxies from Telegram channels.",
@@ -189,6 +198,15 @@ class App:
             text="Serve subscription URLs for NekoRay / v2rayNG on the LAN.",
             wraplength=520,
         ).pack(side="left", padx=(12, 0))
+
+        self.auto_start_subscription_server = tk.BooleanVar(value=False)
+        auto_serve = ttk.Checkbutton(
+            parent,
+            text="Auto-start subscription server when the control panel opens",
+            variable=self.auto_start_subscription_server,
+        )
+        auto_serve.pack(anchor="w", pady=(0, 12))
+        self._watch_config_var(self.auto_start_subscription_server)
 
         self.sub_frame = ttk.LabelFrame(
             parent, text="Subscription link", padding=8
@@ -362,6 +380,14 @@ class App:
         )
         random_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
+        self.auto_start_proxy_pool = tk.BooleanVar(value=False)
+        auto_pool = ttk.Checkbutton(
+            form,
+            text="Auto-start proxy pool when the control panel opens",
+            variable=self.auto_start_proxy_pool,
+        )
+        auto_pool.grid(row=4, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
         for var in (
             self.pool_start_port,
             self.pool_count,
@@ -370,6 +396,7 @@ class App:
             self.pool_reuse_sec,
             self.pool_max_latency_ms,
             self.pool_random,
+            self.auto_start_proxy_pool,
         ):
             self._watch_config_var(var)
 
@@ -1029,6 +1056,17 @@ class App:
             self.pool_random.set(
                 config_bool(getattr(config, "PROXY_POOL_RANDOM", None), True)
             )
+            self.auto_start_scraper.set(
+                config_bool(getattr(config, "GUI_AUTO_START_SCRAPER", None), False)
+            )
+            self.auto_start_subscription_server.set(
+                config_bool(
+                    getattr(config, "GUI_AUTO_START_SUBSCRIPTION_SERVER", None), False
+                )
+            )
+            self.auto_start_proxy_pool.set(
+                config_bool(getattr(config, "GUI_AUTO_START_PROXY_POOL", None), False)
+            )
         finally:
             self._loading_config = False
 
@@ -1067,6 +1105,11 @@ class App:
                 "random": bool(self.pool_random.get()),
             },
             "gui": {
+                "auto_start_scraper": bool(self.auto_start_scraper.get()),
+                "auto_start_subscription_server": bool(
+                    self.auto_start_subscription_server.get()
+                ),
+                "auto_start_proxy_pool": bool(self.auto_start_proxy_pool.get()),
                 "proxy_open_top": max(1, min(50, _safe_int(self.top_count, 10))),
                 "main_pane_ratio": round(self._main_pane_ratio(), 3),
             },
