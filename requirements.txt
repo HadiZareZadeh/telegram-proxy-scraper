@@ -1,4 +1,4 @@
-setuptools<81
+setuptools==80.9.0
 telethon>=1.36.0
 python-socks[asyncio]>=2.4.0
 TelethonFakeTLS>=2022.4.4
