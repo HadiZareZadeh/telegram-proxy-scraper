@@ -13,6 +13,21 @@ telegram:
     - "@meliproxyy"
     - "@PinkProxy"
     - "@NT_Safe"
+    - "@drproxy_channel"
+    - "@Myporoxy"
+    - "@darkproxy"
+    - "@iRoProxy"
+    - "@proxymtprotoir"
+    - "@irproxy"
+    - "@Filtereshekan"
+    - "@bored_vpn"
+    - "@PyroProxy"
+    - "@Forall_Proxy"
+    - "@MTP_roto"
+    - "@hideproxi2"
+    - "@ProxyMTProto_tel"
+    - "@Cheetah_MTP"
+    - "@NPROXY"
   # How many recent messages to scan per source (null = all history; can be slow)
   messages_per_source: 500
 
