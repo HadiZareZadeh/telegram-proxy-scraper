@@ -485,21 +485,9 @@ class ProxyPoolRunner:
                 time.sleep(0.05)
         return False
 
-    def _emit_status(self) -> None:
-        if self._on_status is None:
-            return
-        latency_by_key: dict[str, float | None] = {}
-        if self._servers:
-            config = load_config(required=False)
-            db, _mt, _v2 = open_catalogs(config)
-            try:
-                for row in db.v2ray_list("working"):
-                    key = str(row["key"])
-                    raw = row["last_latency_ms"]
-                    latency_by_key[key] = float(raw) if raw is not None else None
-            finally:
-                db.close()
-
+    def snapshot_statuses(self) -> list[ProxySlotStatus]:
+        """Return current slot statuses for UI tests / display."""
+        latency_by_key = dict(self._latency_by_key)
         with self._slots_lock:
             slots = list(self._slots)
         statuses: list[ProxySlotStatus] = []
@@ -517,4 +505,9 @@ class ProxyPoolRunner:
                     error=slot.error,
                 )
             )
-        self._on_status(statuses)
+        return statuses
+
+    def _emit_status(self) -> None:
+        if self._on_status is None:
+            return
+        self._on_status(self.snapshot_statuses())

@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from fetch_mtproto.cancel import CANCEL_ENV
 from fetch_mtproto.paths import LOGS_DIR, PROJECT_ROOT
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_process_tree
+from fetch_mtproto.v2ray.proxy_pool import ProxyPoolRunner
 
 TELEGRAM_EXE = os.path.join(
     os.environ.get("APPDATA", ""), "Telegram Desktop", "Telegram.exe"
@@ -79,6 +80,8 @@ class App:
         self.proxy_pool: "ProxyPoolRunner | None" = None
         self._config_save_after_id: str | None = None
         self._loading_config = False
+        self._proxy_pool_testing = False
+        self._pool_exit_ips: dict[int, str] = {}
 
         self._build_ui()
         self._load_ui_from_config()
@@ -366,6 +369,13 @@ class App:
             width=24,
         )
         self.pool_btn.pack(side="left")
+        self.pool_test_btn = ttk.Button(
+            btn_row,
+            text="Test proxies",
+            command=self.test_proxy_pool,
+            width=16,
+        )
+        self.pool_test_btn.pack(side="left", padx=(8, 0))
         self.pool_pool_inputs = (
             start_port_spin,
             count_spin,
@@ -378,7 +388,16 @@ class App:
 
         status_frame = ttk.LabelFrame(parent, text="Active proxies", padding=8)
         status_frame.pack(fill="both", expand=True)
-        columns = ("slot", "socks", "http", "upstream", "scheme", "latency", "status")
+        columns = (
+            "slot",
+            "socks",
+            "http",
+            "upstream",
+            "scheme",
+            "latency",
+            "exit_ip",
+            "status",
+        )
         self.pool_tree = ttk.Treeview(
             status_frame,
             columns=columns,
@@ -392,16 +411,18 @@ class App:
             "upstream": "Upstream",
             "scheme": "Scheme",
             "latency": "Latency",
+            "exit_ip": "Exit IP",
             "status": "Status",
         }
         widths = {
             "slot": 40,
-            "socks": 160,
-            "http": 160,
-            "upstream": 180,
-            "scheme": 70,
+            "socks": 150,
+            "http": 150,
+            "upstream": 160,
+            "scheme": 60,
             "latency": 70,
-            "status": 120,
+            "exit_ip": 120,
+            "status": 100,
         }
         for col in columns:
             self.pool_tree.heading(col, text=headings[col])
@@ -1021,7 +1042,6 @@ class App:
     def start_proxy_pool(self) -> None:
         from fetch_mtproto.config_loader import load_config
         from fetch_mtproto.v2ray.ping import resolve_xray_bin
-        from fetch_mtproto.v2ray.proxy_pool import ProxyPoolRunner
 
         if self.proxy_pool is not None and self.proxy_pool.running:
             self.log_line("[proxy pool] already running")
@@ -1074,6 +1094,7 @@ class App:
         )
         self.proxy_pool.start()
         self.pool_btn.configure(text="Stop proxy pool")
+        self._pool_exit_ips.clear()
         for widget in self.pool_pool_inputs:
             widget.configure(state="disabled")
         mode = "random" if random_pick else "fastest-first"
@@ -1083,6 +1104,88 @@ class App:
             f"{mode} ≤{max_latency_ms} ms)"
         )
         self.notebook.select(self.proxy_pool_tab)
+
+    def test_proxy_pool(self) -> None:
+        if self._proxy_pool_testing:
+            self.log_line("[proxy pool] test already running…")
+            return
+        if self.proxy_pool is None or not self.proxy_pool.running:
+            messagebox.showinfo(
+                "fetch-mtproto",
+                "Start the proxy pool first, then click Test proxies.",
+            )
+            return
+        statuses = self.proxy_pool.snapshot_statuses()
+        if not statuses:
+            self.log_line("[proxy pool] no active slots to test")
+            return
+        self._proxy_pool_testing = True
+        self.pool_test_btn.configure(state="disabled")
+        self.log_line(f"[proxy pool] testing {len(statuses)} proxy slot(s)…")
+        threading.Thread(
+            target=self._test_proxy_pool_worker,
+            args=(statuses,),
+            daemon=True,
+            name="proxy-pool-test",
+        ).start()
+
+    def _test_proxy_pool_worker(self, statuses) -> None:
+        import urllib.error
+        import urllib.request
+
+        host_ip = "—"
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=10) as resp:
+                host_ip = resp.read().decode("utf-8", errors="replace").strip()
+        except Exception as exc:
+            host_ip = f"error: {exc}"
+        self.log_line(f"[proxy pool] host public IP: {host_ip}")
+
+        ok = 0
+        fail = 0
+        exit_ips: dict[int, str] = {}
+        for index, item in enumerate(statuses, start=1):
+            if not item.running:
+                exit_ips[item.http_port] = "—"
+                self.log_line(
+                    f"[proxy pool] slot {index} HTTP :{item.http_port} — not running"
+                )
+                fail += 1
+                continue
+            proxy_url = f"http://127.0.0.1:{item.http_port}"
+            handler = urllib.request.ProxyHandler(
+                {"http": proxy_url, "https": proxy_url}
+            )
+            opener = urllib.request.build_opener(handler)
+            try:
+                with opener.open("https://api.ipify.org", timeout=12) as resp:
+                    exit_ip = resp.read().decode("utf-8", errors="replace").strip()
+                exit_ips[item.http_port] = exit_ip
+                ok += 1
+                note = "same as host" if exit_ip == host_ip else "OK"
+                self.log_line(
+                    f"[proxy pool] slot {index} HTTP :{item.http_port} → {exit_ip} ({note})"
+                )
+            except Exception as exc:
+                detail = str(exc) or type(exc).__name__
+                if isinstance(exc, urllib.error.URLError) and exc.reason:
+                    detail = str(exc.reason)
+                exit_ips[item.http_port] = f"fail"
+                fail += 1
+                self.log_line(
+                    f"[proxy pool] slot {index} HTTP :{item.http_port} → FAIL ({detail})"
+                )
+
+        self.log_line(f"[proxy pool] test done: {ok} ok, {fail} failed")
+
+        def finish() -> None:
+            self._pool_exit_ips = exit_ips
+            self._proxy_pool_testing = False
+            self.pool_test_btn.configure(state="normal")
+            if self.proxy_pool is not None and self.proxy_pool.running:
+                self._update_proxy_pool_status(self.proxy_pool.snapshot_statuses())
+
+        self.root.after(0, finish)
 
     def stop_proxy_pool(self) -> None:
         if self.proxy_pool is None:
@@ -1120,6 +1223,7 @@ class App:
                     state = "running"
                 else:
                     state = "stopped"
+                exit_ip = self._pool_exit_ips.get(item.http_port, "—")
                 self.pool_tree.insert(
                     "",
                     "end",
@@ -1130,6 +1234,7 @@ class App:
                         item.host,
                         item.scheme,
                         latency,
+                        exit_ip,
                         state,
                     ),
                 )
@@ -1139,7 +1244,10 @@ class App:
     def _proxy_pool_finished(self) -> None:
         def apply() -> None:
             self.proxy_pool = None
+            self._pool_exit_ips.clear()
+            self._proxy_pool_testing = False
             self.pool_btn.configure(text="Start proxy pool", state="normal")
+            self.pool_test_btn.configure(state="normal")
             for widget in self.pool_pool_inputs:
                 widget.configure(state="normal")
             self._update_proxy_pool_status([])
