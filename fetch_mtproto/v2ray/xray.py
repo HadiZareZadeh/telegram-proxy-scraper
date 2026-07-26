@@ -328,5 +328,37 @@ def build_xray_config(outbound: dict[str, Any], socks_port: int) -> dict[str, An
     }
 
 
+def build_xray_pool_config(
+    outbound: dict[str, Any], socks_port: int, http_port: int
+) -> dict[str, Any]:
+    """Xray config with local SOCKS5 + HTTP inbounds sharing one upstream."""
+    outbound = dict(outbound)
+    outbound.setdefault("tag", "proxy")
+    return {
+        "log": {"loglevel": "error"},
+        "inbounds": [
+            {
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": socks_port,
+                "protocol": "socks",
+                "settings": {"udp": False, "auth": "noauth"},
+            },
+            {
+                "tag": "http-in",
+                "listen": "127.0.0.1",
+                "port": http_port,
+                "protocol": "http",
+                "settings": {},
+            },
+        ],
+        "outbounds": [
+            outbound,
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "block"},
+        ],
+    }
+
+
 def dumps_config(config: dict[str, Any]) -> str:
     return json.dumps(config, ensure_ascii=False, indent=2)

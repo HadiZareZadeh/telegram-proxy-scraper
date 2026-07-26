@@ -76,6 +76,7 @@ class App:
         self.active_stdin: str | None = None
         self._subscription_urls: list[tuple[str, str]] = []
         self._qr_photo = None
+        self.proxy_pool: "ProxyPoolRunner | None" = None
 
         self._build_ui()
         self.root.after(100, self._drain_log_queue)
@@ -118,6 +119,11 @@ class App:
         proxies_tab = ttk.Frame(notebook, padding=12)
         notebook.add(proxies_tab, text="Proxies")
         self._build_proxies_tab(proxies_tab)
+
+        pool_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(pool_tab, text="Proxy pool")
+        self.proxy_pool_tab = pool_tab
+        self._build_proxy_pool_tab(pool_tab)
 
     def _build_jobs_tab(self, parent: ttk.Frame) -> None:
         ttk.Label(
@@ -230,6 +236,107 @@ class App:
             command=self.copy_top_proxies,
         ).pack(side="left", padx=4)
         self._attach_entry_menu(self.top_spin)
+
+    def _build_proxy_pool_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text=(
+                "Run local SOCKS5 + HTTP proxy pairs (one upstream V2Ray server per slot). "
+                "Each slot uses two ports: SOCKS5 then HTTP. No config files written."
+            ),
+            wraplength=720,
+        ).pack(anchor="w", pady=(0, 12))
+
+        form = ttk.Frame(parent)
+        form.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(form, text="Start port").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.pool_start_port = tk.IntVar(value=10801)
+        start_port_spin = ttk.Spinbox(
+            form,
+            from_=1024,
+            to=65000,
+            width=8,
+            textvariable=self.pool_start_port,
+        )
+        start_port_spin.grid(row=0, column=1, sticky="w")
+        self._attach_entry_menu(start_port_spin)
+
+        ttk.Label(form, text="Proxy count").grid(
+            row=0, column=2, sticky="w", padx=(24, 8)
+        )
+        self.pool_count = tk.IntVar(value=10)
+        count_spin = ttk.Spinbox(
+            form,
+            from_=1,
+            to=50,
+            width=4,
+            textvariable=self.pool_count,
+        )
+        count_spin.grid(row=0, column=3, sticky="w")
+        self._attach_entry_menu(count_spin)
+
+        ttk.Label(form, text="Switch servers every (sec)").grid(
+            row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8)
+        )
+        self.pool_switch_sec = tk.IntVar(value=300)
+        switch_spin = ttk.Spinbox(
+            form,
+            from_=30,
+            to=86400,
+            width=8,
+            textvariable=self.pool_switch_sec,
+        )
+        switch_spin.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        self._attach_entry_menu(switch_spin)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.pack(fill="x", pady=(8, 12))
+        self.pool_btn = ttk.Button(
+            btn_row,
+            text="Start proxy pool",
+            command=self.toggle_proxy_pool,
+            width=24,
+        )
+        self.pool_btn.pack(side="left")
+        self.pool_pool_inputs = (start_port_spin, count_spin, switch_spin)
+
+        status_frame = ttk.LabelFrame(parent, text="Active proxies", padding=8)
+        status_frame.pack(fill="both", expand=True)
+        columns = ("slot", "socks", "http", "upstream", "scheme", "latency", "status")
+        self.pool_tree = ttk.Treeview(
+            status_frame,
+            columns=columns,
+            show="headings",
+            height=8,
+        )
+        headings = {
+            "slot": "Slot",
+            "socks": "SOCKS5",
+            "http": "HTTP",
+            "upstream": "Upstream",
+            "scheme": "Scheme",
+            "latency": "Latency",
+            "status": "Status",
+        }
+        widths = {
+            "slot": 40,
+            "socks": 160,
+            "http": 160,
+            "upstream": 180,
+            "scheme": 70,
+            "latency": 70,
+            "status": 120,
+        }
+        for col in columns:
+            self.pool_tree.heading(col, text=headings[col])
+            self.pool_tree.column(col, width=widths[col], stretch=col not in {"slot"})
+        scroll = ttk.Scrollbar(
+            status_frame, orient="vertical", command=self.pool_tree.yview
+        )
+        self.pool_tree.configure(yscrollcommand=scroll.set)
+        self.pool_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
 
     def _build_log_area(self) -> None:
         self.log_wrap = tk.BooleanVar(value=True)
@@ -714,6 +821,130 @@ class App:
 
     # ------------------------------------------------------------- actions
 
+    # ----------------------------------------------------------- proxy pool
+
+    def toggle_proxy_pool(self) -> None:
+        if self.proxy_pool is not None and self.proxy_pool.running:
+            self.stop_proxy_pool()
+        else:
+            self.start_proxy_pool()
+
+    def start_proxy_pool(self) -> None:
+        from fetch_mtproto.config_loader import load_config
+        from fetch_mtproto.v2ray.ping import resolve_xray_bin
+        from fetch_mtproto.v2ray.proxy_pool import ProxyPoolRunner
+
+        if self.proxy_pool is not None and self.proxy_pool.running:
+            self.log_line("[proxy pool] already running")
+            return
+
+        try:
+            start_port = max(1024, int(self.pool_start_port.get()))
+            count = max(1, min(50, int(self.pool_count.get())))
+            switch_sec = max(30, int(self.pool_switch_sec.get()))
+        except tk.TclError:
+            messagebox.showerror("fetch-mtproto", "Invalid proxy pool settings.")
+            return
+
+        last_port = ProxyPoolRunner.last_port(start_port, count)
+        if last_port > 65535:
+            messagebox.showerror(
+                "fetch-mtproto",
+                f"Port range {start_port}–{last_port} exceeds 65535 "
+                f"(each slot uses SOCKS5 + HTTP on two consecutive ports).",
+            )
+            return
+
+        config = load_config(required=False)
+        xray_bin = resolve_xray_bin(getattr(config, "XRAY_BIN", None) if config else None)
+        if not xray_bin:
+            messagebox.showerror(
+                "fetch-mtproto",
+                "Xray binary not found. Run setup or set xray.bin in config.yaml.",
+            )
+            return
+
+        self.proxy_pool = ProxyPoolRunner(
+            start_port=start_port,
+            count=count,
+            switch_interval_sec=float(switch_sec),
+            xray_bin=xray_bin,
+            log=self.log_line,
+            on_status=self._update_proxy_pool_status,
+            on_finished=self._proxy_pool_finished,
+        )
+        self.proxy_pool.start()
+        self.pool_btn.configure(text="Stop proxy pool")
+        for widget in self.pool_pool_inputs:
+            widget.configure(state="disabled")
+        self.log_line(
+            f"[proxy pool] starting {count} slot(s): SOCKS5+HTTP on ports "
+            f"{start_port}–{last_port} (switch every {switch_sec}s)"
+        )
+        self.notebook.select(self.proxy_pool_tab)
+
+    def stop_proxy_pool(self) -> None:
+        if self.proxy_pool is None:
+            return
+        pool = self.proxy_pool
+        self.log_line("[proxy pool] stopping…")
+        self.pool_btn.configure(state="disabled")
+        # Don't block the Tk UI — kill Xray + join on a worker thread.
+        threading.Thread(
+            target=self._stop_proxy_pool_worker,
+            args=(pool,),
+            daemon=True,
+            name="proxy-pool-stop",
+        ).start()
+
+    def _stop_proxy_pool_worker(self, pool) -> None:
+        try:
+            pool.stop()
+        except Exception as exc:
+            self.log_line(f"[proxy pool] stop failed: {exc}")
+            self.root.after(0, self._proxy_pool_finished)
+
+    def _update_proxy_pool_status(self, statuses) -> None:
+        def apply() -> None:
+            self.pool_tree.delete(*self.pool_tree.get_children())
+            for index, item in enumerate(statuses, start=1):
+                latency = (
+                    f"{item.latency_ms:.0f} ms"
+                    if item.latency_ms is not None
+                    else "—"
+                )
+                if item.error:
+                    state = f"error: {item.error}"
+                elif item.running:
+                    state = "running"
+                else:
+                    state = "stopped"
+                self.pool_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        index,
+                        f"socks5://127.0.0.1:{item.socks_port}",
+                        f"http://127.0.0.1:{item.http_port}",
+                        item.host,
+                        item.scheme,
+                        latency,
+                        state,
+                    ),
+                )
+
+        self.root.after(0, apply)
+
+    def _proxy_pool_finished(self) -> None:
+        def apply() -> None:
+            self.proxy_pool = None
+            self.pool_btn.configure(text="Start proxy pool", state="normal")
+            for widget in self.pool_pool_inputs:
+                widget.configure(state="normal")
+            self._update_proxy_pool_status([])
+
+        self.root.after(0, apply)
+
     def _load_top_proxies(self, count: int):
         from fetch_mtproto.catalogs import open_catalogs
         from fetch_mtproto.config_loader import load_config
@@ -807,8 +1038,11 @@ class App:
 
     def _on_close(self) -> None:
         running = [k for k, j in self.jobs.items() if j.running]
-        if running:
+        pool_running = self.proxy_pool is not None and self.proxy_pool.running
+        if running or pool_running:
             labels = ", ".join(self.JOBS[k]["label"] for k in running)
+            if pool_running:
+                labels = f"{labels}, Proxy pool" if labels else "Proxy pool"
             if not messagebox.askyesno(
                 "fetch-mtproto", f"Stop running tasks and exit?\n({labels})"
             ):
@@ -817,6 +1051,8 @@ class App:
                 job = self.jobs[key]
                 if job.process is not None:
                     kill_process_tree(job.process)
+            if pool_running and self.proxy_pool is not None:
+                self.proxy_pool.stop()
         self.root.destroy()
 
     def _schedule_auto_start_jobs(self) -> None:
