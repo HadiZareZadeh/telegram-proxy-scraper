@@ -81,7 +81,6 @@ class App:
         self._config_save_after_id: str | None = None
         self._loading_config = False
         self._proxy_pool_testing = False
-        self._pool_exit_ips: dict[int, str] = {}
 
         self._build_ui()
         self._load_ui_from_config()
@@ -93,9 +92,23 @@ class App:
 
     def _build_ui(self) -> None:
         self._build_status_bar()
-        self._build_notebook()
-        self._build_log_area()
-        self._build_input_bar()
+
+        self.main_pane = ttk.Panedwindow(self.root, orient=tk.VERTICAL)
+        self.main_pane.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+
+        self.top_pane = ttk.Frame(self.main_pane)
+        self.bottom_pane = ttk.Frame(self.main_pane)
+        self.main_pane.add(self.top_pane, weight=3)
+        self.main_pane.add(self.bottom_pane, weight=1)
+
+        self._build_notebook(self.top_pane)
+        self.bottom_pane.rowconfigure(0, weight=1)
+        self.bottom_pane.columnconfigure(0, weight=1)
+        self._build_log_area(self.bottom_pane)
+        self._build_input_bar(self.bottom_pane)
+
+        self.main_pane.bind("<ButtonRelease-1>", self._on_main_pane_release)
+        self.root.after(150, self._restore_main_pane_sash)
 
     def _build_status_bar(self) -> None:
         bar = ttk.Frame(self.root, padding=(8, 8, 8, 0))
@@ -108,9 +121,9 @@ class App:
         status_label.pack(side="right", padx=12)
         self._attach_status_menu(status_label)
 
-    def _build_notebook(self) -> None:
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=8, pady=4)
+    def _build_notebook(self, parent: ttk.Frame) -> None:
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill="both", expand=True)
         self.notebook = notebook
 
         jobs_tab = ttk.Frame(notebook, padding=12)
@@ -395,7 +408,8 @@ class App:
             "upstream",
             "scheme",
             "latency",
-            "exit_ip",
+            "upload",
+            "download",
             "status",
         )
         self.pool_tree = ttk.Treeview(
@@ -411,17 +425,19 @@ class App:
             "upstream": "Upstream",
             "scheme": "Scheme",
             "latency": "Latency",
-            "exit_ip": "Exit IP",
+            "upload": "↑ Upload",
+            "download": "↓ Download",
             "status": "Status",
         }
         widths = {
             "slot": 40,
-            "socks": 150,
-            "http": 150,
-            "upstream": 160,
+            "socks": 140,
+            "http": 140,
+            "upstream": 150,
             "scheme": 60,
             "latency": 70,
-            "exit_ip": 120,
+            "upload": 90,
+            "download": 90,
             "status": 100,
         }
         for col in columns:
@@ -434,24 +450,51 @@ class App:
         self.pool_tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
-    def _build_log_area(self) -> None:
+    def _build_log_area(self, parent: ttk.Frame) -> None:
         self.log_wrap = tk.BooleanVar(value=True)
         self.log_autoscroll = tk.BooleanVar(value=True)
         self.log = scrolledtext.ScrolledText(
-            self.root, wrap="word", state="disabled", font=("Consolas", 9), height=12
+            parent, wrap="word", state="disabled", font=("Consolas", 9), height=8
         )
-        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.log.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
         self._attach_log_menu(self.log)
 
-    def _build_input_bar(self) -> None:
-        bottom = ttk.Frame(self.root, padding=(8, 0, 8, 8))
-        bottom.pack(fill="x")
+    def _build_input_bar(self, parent: ttk.Frame) -> None:
+        bottom = ttk.Frame(parent, padding=(0, 0, 0, 8))
+        bottom.grid(row=1, column=0, sticky="ew")
         ttk.Label(bottom, text="Input (login code / phone):").pack(side="left")
         self.stdin_entry = ttk.Entry(bottom)
         self.stdin_entry.pack(side="left", fill="x", expand=True, padx=6)
         self.stdin_entry.bind("<Return>", lambda _e: self.send_stdin())
         ttk.Button(bottom, text="Send", command=self.send_stdin).pack(side="left")
         self._attach_entry_menu(self.stdin_entry)
+
+    def _main_pane_ratio(self) -> float:
+        try:
+            total = max(1, int(self.main_pane.winfo_height()))
+            sash = int(self.main_pane.sashpos(0))
+            return max(0.15, min(0.85, sash / total))
+        except tk.TclError:
+            return 0.65
+
+    def _restore_main_pane_sash(self) -> None:
+        from fetch_mtproto.config_loader import config_float, load_config
+
+        config = load_config(required=False)
+        ratio = 0.65
+        if config is not None:
+            ratio = config_float(getattr(config, "GUI_MAIN_PANE_RATIO", None), 0.65)
+            ratio = max(0.15, min(0.85, ratio))
+        try:
+            self.root.update_idletasks()
+            height = int(self.main_pane.winfo_height())
+            if height > 80:
+                self.main_pane.sashpos(0, int(height * ratio))
+        except tk.TclError:
+            pass
+
+    def _on_main_pane_release(self, _event: tk.Event | None = None) -> None:
+        self._schedule_save_ui_config()
 
     # ------------------------------------------------------- context menus
 
@@ -1025,6 +1068,7 @@ class App:
             },
             "gui": {
                 "proxy_open_top": max(1, min(50, _safe_int(self.top_count, 10))),
+                "main_pane_ratio": round(self._main_pane_ratio(), 3),
             },
         }
 
@@ -1094,7 +1138,6 @@ class App:
         )
         self.proxy_pool.start()
         self.pool_btn.configure(text="Stop proxy pool")
-        self._pool_exit_ips.clear()
         for widget in self.pool_pool_inputs:
             widget.configure(state="disabled")
         mode = "random" if random_pick else "fastest-first"
@@ -1143,10 +1186,8 @@ class App:
 
         ok = 0
         fail = 0
-        exit_ips: dict[int, str] = {}
         for index, item in enumerate(statuses, start=1):
             if not item.running:
-                exit_ips[item.http_port] = "—"
                 self.log_line(
                     f"[proxy pool] slot {index} HTTP :{item.http_port} — not running"
                 )
@@ -1160,7 +1201,6 @@ class App:
             try:
                 with opener.open("https://api.ipify.org", timeout=12) as resp:
                     exit_ip = resp.read().decode("utf-8", errors="replace").strip()
-                exit_ips[item.http_port] = exit_ip
                 ok += 1
                 note = "same as host" if exit_ip == host_ip else "OK"
                 self.log_line(
@@ -1170,7 +1210,6 @@ class App:
                 detail = str(exc) or type(exc).__name__
                 if isinstance(exc, urllib.error.URLError) and exc.reason:
                     detail = str(exc.reason)
-                exit_ips[item.http_port] = f"fail"
                 fail += 1
                 self.log_line(
                     f"[proxy pool] slot {index} HTTP :{item.http_port} → FAIL ({detail})"
@@ -1179,11 +1218,8 @@ class App:
         self.log_line(f"[proxy pool] test done: {ok} ok, {fail} failed")
 
         def finish() -> None:
-            self._pool_exit_ips = exit_ips
             self._proxy_pool_testing = False
             self.pool_test_btn.configure(state="normal")
-            if self.proxy_pool is not None and self.proxy_pool.running:
-                self._update_proxy_pool_status(self.proxy_pool.snapshot_statuses())
 
         self.root.after(0, finish)
 
@@ -1223,7 +1259,6 @@ class App:
                     state = "running"
                 else:
                     state = "stopped"
-                exit_ip = self._pool_exit_ips.get(item.http_port, "—")
                 self.pool_tree.insert(
                     "",
                     "end",
@@ -1234,7 +1269,8 @@ class App:
                         item.host,
                         item.scheme,
                         latency,
-                        exit_ip,
+                        item.upload_text,
+                        item.download_text,
                         state,
                     ),
                 )
@@ -1244,7 +1280,6 @@ class App:
     def _proxy_pool_finished(self) -> None:
         def apply() -> None:
             self.proxy_pool = None
-            self._pool_exit_ips.clear()
             self._proxy_pool_testing = False
             self.pool_btn.configure(text="Start proxy pool", state="normal")
             self.pool_test_btn.configure(state="normal")

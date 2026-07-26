@@ -21,6 +21,7 @@ from fetch_mtproto.v2ray.store import V2RayServer, _server_from_row, is_nekoray_
 from fetch_mtproto.v2ray.xray import (
     XRAY_SCHEMES,
     build_xray_pool_config,
+    format_traffic_bytes,
     link_to_xray_outbound,
 )
 
@@ -29,10 +30,14 @@ StatusFn = Callable[[list["ProxySlotStatus"]], None]
 FinishedFn = Callable[[], None]
 
 PORTS_PER_SLOT = 2
+# Stats API port offset from SOCKS port (keeps user-facing SOCKS/HTTP layout).
+API_PORT_OFFSET = 10000
+TRAFFIC_POLL_SEC = 2.0
 # Defaults; overridden by config.yaml proxy_pool.* when the runner is started.
 DEFAULT_REUSE_AFTER_ROTATIONS = 5
 DEFAULT_REUSE_AFTER_SEC = 20 * 60
 DEFAULT_MAX_LATENCY_MS = 2000
+
 
 @dataclass(slots=True)
 class ProxySlotStatus:
@@ -43,16 +48,32 @@ class ProxySlotStatus:
     latency_ms: float | None
     running: bool
     error: str | None = None
+    upload_bytes: int = 0
+    download_bytes: int = 0
+
+    @property
+    def upload_text(self) -> str:
+        return format_traffic_bytes(self.upload_bytes)
+
+    @property
+    def download_text(self) -> str:
+        return format_traffic_bytes(self.download_bytes)
 
 
 @dataclass
 class _ProxySlot:
     socks_port: int
     http_port: int
+    api_port: int = 0
     process: subprocess.Popen | None = None
     cfg_path: Path | None = None
     server: V2RayServer | None = None
     error: str | None = None
+    # Lifetime totals for this pool session (survive upstream rotations).
+    base_upload: int = 0
+    base_download: int = 0
+    upload_bytes: int = 0
+    download_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -93,6 +114,7 @@ class ProxyPoolRunner:
         self._latency_by_key: dict[str, float] = {}
 
         self._thread: threading.Thread | None = None
+        self._traffic_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._slots_lock = threading.Lock()
         self._slots: list[_ProxySlot] = []
@@ -113,6 +135,10 @@ class ProxyPoolRunner:
     def ports_for_slot(start_port: int, slot_index: int) -> tuple[int, int]:
         base = start_port + slot_index * PORTS_PER_SLOT
         return base, base + 1
+
+    @staticmethod
+    def api_port_for_socks(socks_port: int) -> int:
+        return socks_port + API_PORT_OFFSET
 
     @staticmethod
     def last_port(start_port: int, count: int) -> int:
@@ -169,7 +195,11 @@ class ProxyPoolRunner:
                 for index in range(self.count):
                     socks_port, http_port = self.ports_for_slot(self.start_port, index)
                     self._slots.append(
-                        _ProxySlot(socks_port=socks_port, http_port=http_port)
+                        _ProxySlot(
+                            socks_port=socks_port,
+                            http_port=http_port,
+                            api_port=self.api_port_for_socks(socks_port),
+                        )
                     )
             self._rotation_round = 0
             self._usage.clear()
@@ -179,6 +209,12 @@ class ProxyPoolRunner:
             if self._stop_event.is_set():
                 return
             self._emit_status()
+            self._traffic_thread = threading.Thread(
+                target=self._traffic_loop,
+                name="proxy-pool-traffic",
+                daemon=True,
+            )
+            self._traffic_thread.start()
 
             while not self._stop_event.wait(self.switch_interval_sec):
                 self._rotation_round += 1
@@ -386,18 +422,26 @@ class ProxyPoolRunner:
     def _restart_slot(self, slot: _ProxySlot, server: V2RayServer) -> None:
         if self._stop_event.is_set():
             return
+        self._commit_slot_traffic(slot)
         self._stop_slot(slot)
         if self._stop_event.is_set():
             return
         slot.error = None
         slot.server = server
+        if not slot.api_port:
+            slot.api_port = self.api_port_for_socks(slot.socks_port)
 
         outbound = link_to_xray_outbound(server)
         if outbound is None:
             slot.error = f"unsupported scheme: {server.scheme}"
             return
 
-        config = build_xray_pool_config(outbound, slot.socks_port, slot.http_port)
+        config = build_xray_pool_config(
+            outbound,
+            slot.socks_port,
+            slot.http_port,
+            api_port=slot.api_port,
+        )
         cfg_path = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / (
             f"fetch-mtproto-pool-{slot.socks_port}-{int(time.time() * 1000)}.json"
         )
@@ -460,10 +504,76 @@ class ProxyPoolRunner:
                 pass
             slot.cfg_path = None
 
+    def _commit_slot_traffic(self, slot: _ProxySlot) -> None:
+        """Fold current Xray counters into lifetime totals before process restart."""
+        self._poll_slot_traffic(slot)
+        slot.base_upload = slot.upload_bytes
+        slot.base_download = slot.download_bytes
+
+    def _traffic_loop(self) -> None:
+        while not self._stop_event.wait(TRAFFIC_POLL_SEC):
+            self._refresh_all_traffic()
+            self._emit_status()
+
+    def _refresh_all_traffic(self) -> None:
+        with self._slots_lock:
+            slots = list(self._slots)
+        for slot in slots:
+            if self._stop_event.is_set():
+                return
+            self._poll_slot_traffic(slot)
+
+    def _poll_slot_traffic(self, slot: _ProxySlot) -> None:
+        if slot.process is None or slot.process.poll() is not None:
+            return
+        up, down = self._query_outbound_traffic(slot.api_port)
+        slot.upload_bytes = slot.base_upload + up
+        slot.download_bytes = slot.base_download + down
+
+    def _query_outbound_traffic(self, api_port: int) -> tuple[int, int]:
+        """Return (uplink, downlink) bytes for outbound tag 'proxy' via xray API."""
+        if not self._bin_path or api_port <= 0:
+            return 0, 0
+        try:
+            result = subprocess.run(
+                [
+                    self._bin_path,
+                    "api",
+                    "statsquery",
+                    f"--server=127.0.0.1:{api_port}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                **hide_console_kwargs(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return 0, 0
+        if result.returncode != 0 or not result.stdout.strip():
+            return 0, 0
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return 0, 0
+        uplink = 0
+        downlink = 0
+        for item in payload.get("stat") or []:
+            name = str(item.get("name") or "")
+            try:
+                value = int(item.get("value") or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if name == "outbound>>>proxy>>>traffic>>>uplink":
+                uplink = value
+            elif name == "outbound>>>proxy>>>traffic>>>downlink":
+                downlink = value
+        return uplink, downlink
+
     def _kill_all_processes(self) -> None:
         with self._slots_lock:
             slots = list(self._slots)
         for slot in slots:
+            self._commit_slot_traffic(slot)
             self._stop_slot(slot)
 
     def _cleanup_all(self) -> None:
@@ -471,6 +581,7 @@ class ProxyPoolRunner:
             slots = list(self._slots)
             self._slots = []
         for slot in slots:
+            self._commit_slot_traffic(slot)
             self._stop_slot(slot)
 
     def _wait_port(self, host: str, port: int, *, timeout: float) -> bool:
@@ -503,6 +614,8 @@ class ProxyPoolRunner:
                     latency_ms=latency_by_key.get(server.key) if server else None,
                     running=running and slot.error is None,
                     error=slot.error,
+                    upload_bytes=slot.upload_bytes,
+                    download_bytes=slot.download_bytes,
                 )
             )
         return statuses

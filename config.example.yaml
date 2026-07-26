@@ -104,3 +104,5 @@ gui:
   auto_start_proxy_pool: false
   # Proxies tab: how many MTProto links to open/copy by default
   proxy_open_top: 10
+  # Vertical split: fraction of window for tabs (rest is log + input)
+  main_pane_ratio: 0.65

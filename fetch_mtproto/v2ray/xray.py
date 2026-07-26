@@ -329,36 +329,91 @@ def build_xray_config(outbound: dict[str, Any], socks_port: int) -> dict[str, An
 
 
 def build_xray_pool_config(
-    outbound: dict[str, Any], socks_port: int, http_port: int
+    outbound: dict[str, Any],
+    socks_port: int,
+    http_port: int,
+    *,
+    api_port: int | None = None,
 ) -> dict[str, Any]:
-    """Xray config with local SOCKS5 + HTTP inbounds sharing one upstream."""
+    """Xray config with local SOCKS5 + HTTP inbounds sharing one upstream.
+
+    When api_port is set, enables StatsService so traffic can be queried
+    (NekoRay-style ↑/↓ counters).
+    """
     outbound = dict(outbound)
     outbound.setdefault("tag", "proxy")
-    return {
+    inbounds: list[dict[str, Any]] = [
+        {
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": socks_port,
+            "protocol": "socks",
+            "settings": {"udp": False, "auth": "noauth"},
+        },
+        {
+            "tag": "http-in",
+            "listen": "127.0.0.1",
+            "port": http_port,
+            "protocol": "http",
+            "settings": {},
+        },
+    ]
+    config: dict[str, Any] = {
         "log": {"loglevel": "error"},
-        "inbounds": [
-            {
-                "tag": "socks-in",
-                "listen": "127.0.0.1",
-                "port": socks_port,
-                "protocol": "socks",
-                "settings": {"udp": False, "auth": "noauth"},
-            },
-            {
-                "tag": "http-in",
-                "listen": "127.0.0.1",
-                "port": http_port,
-                "protocol": "http",
-                "settings": {},
-            },
-        ],
+        "inbounds": inbounds,
         "outbounds": [
             outbound,
             {"protocol": "freedom", "tag": "direct"},
             {"protocol": "blackhole", "tag": "block"},
         ],
     }
+    if api_port is not None:
+        inbounds.insert(
+            0,
+            {
+                "tag": "api",
+                "listen": "127.0.0.1",
+                "port": api_port,
+                "protocol": "dokodemo-door",
+                "settings": {"address": "127.0.0.1"},
+            },
+        )
+        config["stats"] = {}
+        config["api"] = {
+            "tag": "api",
+            "services": ["StatsService"],
+        }
+        config["policy"] = {
+            "system": {
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+            }
+        }
+        config["routing"] = {
+            "rules": [
+                {
+                    "type": "field",
+                    "inboundTag": ["api"],
+                    "outboundTag": "api",
+                }
+            ]
+        }
+    return config
 
 
 def dumps_config(config: dict[str, Any]) -> str:
     return json.dumps(config, ensure_ascii=False, indent=2)
+
+
+def format_traffic_bytes(n: int) -> str:
+    """Human-readable size like NekoRay (B / KB / MB / GB)."""
+    value = float(max(0, int(n)))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{value:.2f} TB"
