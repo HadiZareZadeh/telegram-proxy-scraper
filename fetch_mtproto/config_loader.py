@@ -56,6 +56,8 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("proxy_pool", "switch_interval_sec", "PROXY_POOL_SWITCH_INTERVAL_SEC"),
     ("proxy_pool", "reuse_after_rotations", "PROXY_POOL_REUSE_AFTER_ROTATIONS"),
     ("proxy_pool", "reuse_after_sec", "PROXY_POOL_REUSE_AFTER_SEC"),
+    ("proxy_pool", "max_latency_ms", "PROXY_POOL_MAX_LATENCY_MS"),
+    ("proxy_pool", "random", "PROXY_POOL_RANDOM"),
 )
 
 _SECTION_RE = re.compile(r"^([A-Za-z_][\w]*)\s*:")
@@ -110,6 +112,22 @@ def config_int(
     if maximum is not None:
         n = min(maximum, n)
     return n
+
+
+def config_bool(value: object, default: bool = False) -> bool:
+    """Coerce a config value to bool; use default when missing or invalid."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def resolve_max_working(value: object) -> int | None:

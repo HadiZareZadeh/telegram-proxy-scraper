@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import subprocess
 import threading
@@ -31,7 +32,7 @@ PORTS_PER_SLOT = 2
 # Defaults; overridden by config.yaml proxy_pool.* when the runner is started.
 DEFAULT_REUSE_AFTER_ROTATIONS = 5
 DEFAULT_REUSE_AFTER_SEC = 20 * 60
-
+DEFAULT_MAX_LATENCY_MS = 2000
 
 @dataclass(slots=True)
 class ProxySlotStatus:
@@ -72,6 +73,8 @@ class ProxyPoolRunner:
         xray_bin: str | None = None,
         reuse_after_rotations: int = DEFAULT_REUSE_AFTER_ROTATIONS,
         reuse_after_sec: float = DEFAULT_REUSE_AFTER_SEC,
+        max_latency_ms: float = DEFAULT_MAX_LATENCY_MS,
+        random_pick: bool = True,
         log: LogFn | None = None,
         on_status: StatusFn | None = None,
         on_finished: FinishedFn | None = None,
@@ -82,9 +85,12 @@ class ProxyPoolRunner:
         self.xray_bin = xray_bin
         self.reuse_after_rotations = max(1, int(reuse_after_rotations))
         self.reuse_after_sec = max(1.0, float(reuse_after_sec))
+        self.max_latency_ms = max(1.0, float(max_latency_ms))
+        self.random_pick = bool(random_pick)
         self._log = log or (lambda _msg: None)
         self._on_status = on_status
         self._on_finished = on_finished
+        self._latency_by_key: dict[str, float] = {}
 
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -146,14 +152,16 @@ class ProxyPoolRunner:
             self._refresh_servers()
             if not self._servers:
                 self._log(
-                    "[proxy pool] no working Xray-compatible V2Ray servers — run Ping V2Ray first"
+                    f"[proxy pool] no working Xray-compatible V2Ray servers with "
+                    f"latency ≤ {self.max_latency_ms:.0f} ms — run Ping V2Ray first"
                 )
                 return
 
             if len(self._servers) < self.count:
                 self._log(
-                    f"[proxy pool] only {len(self._servers)} server(s) available "
-                    f"for {self.count} proxy slot(s); some upstreams will be reused"
+                    f"[proxy pool] only {len(self._servers)} server(s) ≤ "
+                    f"{self.max_latency_ms:.0f} ms for {self.count} slot(s); "
+                    f"some upstreams may be reused"
                 )
 
             with self._slots_lock:
@@ -194,11 +202,22 @@ class ProxyPoolRunner:
         self._servers = self._load_servers()
 
     def _load_servers(self) -> list[V2RayServer]:
+        """Load working servers with latency ≤ max — independent of subscription ranking."""
         config = load_config(required=False)
         db, _mt, _v2 = open_catalogs(config)
         try:
-            rows = db.v2ray_subscription_list(limit=None)
+            rows = db.conn.execute(
+                """
+                SELECT * FROM v2ray
+                WHERE status = 'working'
+                  AND last_latency_ms IS NOT NULL
+                  AND last_latency_ms <= ?
+                ORDER BY last_latency_ms ASC, key
+                """,
+                (self.max_latency_ms,),
+            ).fetchall()
             servers: list[V2RayServer] = []
+            latency_by_key: dict[str, float] = {}
             for row in rows:
                 server = _server_from_row(row)
                 if server.scheme not in XRAY_SCHEMES:
@@ -208,6 +227,8 @@ class ProxyPoolRunner:
                 if link_to_xray_outbound(server) is None:
                     continue
                 servers.append(server)
+                latency_by_key[server.key] = float(row["last_latency_ms"])
+            self._latency_by_key = latency_by_key
             return servers
         finally:
             db.close()
@@ -223,15 +244,16 @@ class ProxyPoolRunner:
             or age_sec >= self.reuse_after_sec
         )
 
+    def _server_latency(self, server: V2RayServer) -> float:
+        return self._latency_by_key.get(server.key, self.max_latency_ms)
+
     def _pick_servers(self, count: int) -> list[V2RayServer]:
-        """Pick distinct upstreams, preferring ones off cooldown."""
+        """Pick distinct upstreams from the low-latency pool (off cooldown first)."""
         if not self._servers:
             return []
 
         now = time.monotonic()
         rotation = self._rotation_round
-        # Never re-assign the immediately previous set unless they are already reusable
-        # (they usually are not — still on cooldown).
         previous_blocked = {
             key
             for key in self._previous_keys
@@ -252,6 +274,11 @@ class ProxyPoolRunner:
                 record = self._usage[server.key]
                 cooling.append((record.used_at, server))
 
+        if self.random_pick:
+            random.shuffle(available)
+        else:
+            available.sort(key=self._server_latency)
+
         picked: list[V2RayServer] = []
         seen: set[str] = set()
 
@@ -264,7 +291,8 @@ class ProxyPoolRunner:
             seen.add(server.key)
 
         if len(picked) < count:
-            # Oldest last-used first (most cooled). Last resort when catalog is thin.
+            if self.random_pick:
+                random.shuffle(cooling)
             cooling.sort(key=lambda item: item[0])
             reused = 0
             for _score, server in cooling:
@@ -281,12 +309,16 @@ class ProxyPoolRunner:
                     f"reused {reused} early (need {count})"
                 )
 
-        # Still short? Cycle available catalog (same server on multiple slots).
         if len(picked) < count and self._servers:
-            index = 0
-            while len(picked) < count:
-                picked.append(self._servers[index % len(self._servers)])
-                index += 1
+            pool = list(self._servers)
+            if self.random_pick:
+                while len(picked) < count:
+                    picked.append(random.choice(pool))
+            else:
+                index = 0
+                while len(picked) < count:
+                    picked.append(pool[index % len(pool)])
+                    index += 1
             self._log(
                 f"[proxy pool] catalog smaller than slot count — "
                 f"duplicating upstreams for {count - len(seen)} slot(s)"
@@ -324,8 +356,10 @@ class ProxyPoolRunner:
                 key, now=time.monotonic(), rotation=self._rotation_round
             )
         )
+        mode = "random" if self.random_pick else "fastest-first"
         self._log(
-            f"[proxy pool] assigned {len(selected)} upstream(s); "
+            f"[proxy pool] assigned {len(selected)} upstream(s) ({mode}) "
+            f"from {len(self._servers)} server(s) ≤ {self.max_latency_ms:.0f} ms; "
             f"{cooling} server(s) on cooldown "
             f"(reuse after {self.reuse_after_rotations} rotations or "
             f"{int(self.reuse_after_sec) // 60} min)"
@@ -459,7 +493,7 @@ class ProxyPoolRunner:
             config = load_config(required=False)
             db, _mt, _v2 = open_catalogs(config)
             try:
-                for row in db.v2ray_subscription_list(limit=None):
+                for row in db.v2ray_list("working"):
                     key = str(row["key"])
                     raw = row["last_latency_ms"]
                     latency_by_key[key] = float(raw) if raw is not None else None

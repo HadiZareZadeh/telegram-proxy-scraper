@@ -246,7 +246,9 @@ class App:
             parent,
             text=(
                 "Run local SOCKS5 + HTTP proxy pairs (one upstream V2Ray server per slot). "
-                "Each slot uses two ports: SOCKS5 then HTTP. Settings are saved to config.yaml."
+                "Each slot uses two ports: SOCKS5 then HTTP. "
+                "Upstreams are chosen from working servers within max latency "
+                "(random or fastest-first). Settings are saved to config.yaml."
             ),
             wraplength=720,
         ).pack(anchor="w", pady=(0, 12))
@@ -322,12 +324,36 @@ class App:
         reuse_sec_spin.grid(row=2, column=1, sticky="w", pady=(8, 0))
         self._attach_entry_menu(reuse_sec_spin)
 
+        ttk.Label(form, text="Max latency (ms)").grid(
+            row=2, column=2, sticky="w", padx=(24, 8), pady=(8, 0)
+        )
+        self.pool_max_latency_ms = tk.IntVar(value=2000)
+        max_lat_spin = ttk.Spinbox(
+            form,
+            from_=100,
+            to=60000,
+            width=8,
+            textvariable=self.pool_max_latency_ms,
+        )
+        max_lat_spin.grid(row=2, column=3, sticky="w", pady=(8, 0))
+        self._attach_entry_menu(max_lat_spin)
+
+        self.pool_random = tk.BooleanVar(value=True)
+        random_check = ttk.Checkbutton(
+            form,
+            text="Pick randomly (off = fastest first)",
+            variable=self.pool_random,
+        )
+        random_check.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
         for var in (
             self.pool_start_port,
             self.pool_count,
             self.pool_switch_sec,
             self.pool_reuse_rotations,
             self.pool_reuse_sec,
+            self.pool_max_latency_ms,
+            self.pool_random,
         ):
             self._watch_config_var(var)
 
@@ -346,6 +372,8 @@ class App:
             switch_spin,
             reuse_rot_spin,
             reuse_sec_spin,
+            max_lat_spin,
+            random_check,
         )
 
         status_frame = ttk.LabelFrame(parent, text="Active proxies", padding=8)
@@ -924,6 +952,19 @@ class App:
                     maximum=86400,
                 )
             )
+            self.pool_max_latency_ms.set(
+                config_int(
+                    getattr(config, "PROXY_POOL_MAX_LATENCY_MS", None),
+                    2000,
+                    minimum=100,
+                    maximum=60000,
+                )
+            )
+            from fetch_mtproto.config_loader import config_bool
+
+            self.pool_random.set(
+                config_bool(getattr(config, "PROXY_POOL_RANDOM", None), True)
+            )
         finally:
             self._loading_config = False
 
@@ -956,6 +997,10 @@ class App:
                     1, min(100, _safe_int(self.pool_reuse_rotations, 5))
                 ),
                 "reuse_after_sec": max(60, min(86400, _safe_int(self.pool_reuse_sec, 1200))),
+                "max_latency_ms": max(
+                    100, min(60000, _safe_int(self.pool_max_latency_ms, 2000))
+                ),
+                "random": bool(self.pool_random.get()),
             },
             "gui": {
                 "proxy_open_top": max(1, min(50, _safe_int(self.top_count, 10))),
@@ -988,6 +1033,8 @@ class App:
             switch_sec = max(30, int(self.pool_switch_sec.get()))
             reuse_rotations = max(1, int(self.pool_reuse_rotations.get()))
             reuse_sec = max(60, int(self.pool_reuse_sec.get()))
+            max_latency_ms = max(100, int(self.pool_max_latency_ms.get()))
+            random_pick = bool(self.pool_random.get())
         except tk.TclError:
             messagebox.showerror("fetch-mtproto", "Invalid proxy pool settings.")
             return
@@ -1019,6 +1066,8 @@ class App:
             xray_bin=xray_bin,
             reuse_after_rotations=reuse_rotations,
             reuse_after_sec=float(reuse_sec),
+            max_latency_ms=float(max_latency_ms),
+            random_pick=random_pick,
             log=self.log_line,
             on_status=self._update_proxy_pool_status,
             on_finished=self._proxy_pool_finished,
@@ -1027,9 +1076,11 @@ class App:
         self.pool_btn.configure(text="Stop proxy pool")
         for widget in self.pool_pool_inputs:
             widget.configure(state="disabled")
+        mode = "random" if random_pick else "fastest-first"
         self.log_line(
             f"[proxy pool] starting {count} slot(s): SOCKS5+HTTP on ports "
-            f"{start_port}–{last_port} (switch every {switch_sec}s)"
+            f"{start_port}–{last_port} (switch every {switch_sec}s, "
+            f"{mode} ≤{max_latency_ms} ms)"
         )
         self.notebook.select(self.proxy_pool_tab)
 

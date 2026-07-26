@@ -77,6 +77,10 @@ proxy_pool:
   # Do not reuse an upstream until either threshold is met
   reuse_after_rotations: 5
   reuse_after_sec: 1200
+  # Working servers at or below this latency (ms) are eligible
+  max_latency_ms: 2000
+  # true = shuffle eligible servers each round; false = fastest-first
+  random: true
 
 gui:
   # When using app.pyw, start these jobs automatically after the control panel opens
