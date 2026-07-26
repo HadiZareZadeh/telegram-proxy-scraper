@@ -1,4 +1,4 @@
-"""All-in-one Tkinter GUI: scrape, ping, subscription server, open proxies."""
+"""All-in-one Tkinter GUI: tabbed control panel for scrape, ping, subscription."""
 
 from __future__ import annotations
 
@@ -85,61 +85,101 @@ class App:
     # ------------------------------------------------------------------ UI
 
     def _build_ui(self) -> None:
-        top = ttk.Frame(self.root, padding=8)
-        top.pack(fill="x")
+        self._build_status_bar()
+        self._build_notebook()
+        self._build_log_area()
+        self._build_input_bar()
 
-        for key, spec in self.JOBS.items():
-            btn = ttk.Button(
-                top,
-                text=f"Start {spec['label']}" if spec["long_running"] else spec["label"],
-                command=lambda k=key: self.toggle_job(k),
-                width=22,
-            )
-            btn.pack(side="left", padx=4)
-            self.buttons[key] = btn
-
-        proxies_frame = ttk.Frame(self.root, padding=(8, 0))
-        proxies_frame.pack(fill="x")
-        ttk.Label(proxies_frame, text="Open top").pack(side="left")
-        self.top_count = tk.IntVar(value=10)
-        self.top_spin = ttk.Spinbox(
-            proxies_frame,
-            from_=1,
-            to=50,
-            width=4,
-            textvariable=self.top_count,
+    def _build_status_bar(self) -> None:
+        bar = ttk.Frame(self.root, padding=(8, 8, 8, 0))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Refresh status", command=self.refresh_status).pack(
+            side="right"
         )
-        self.top_spin.pack(side="left", padx=4)
-        ttk.Button(
-            proxies_frame,
-            text="proxies in Telegram",
-            command=self.open_top_proxies,
-        ).pack(side="left", padx=4)
-        ttk.Button(
-            proxies_frame,
-            text="copy 10 links",
-            command=self.copy_top_proxies,
-        ).pack(side="left", padx=4)
-
-        ttk.Button(
-            proxies_frame, text="Refresh status", command=self.refresh_status
-        ).pack(side="right")
         self.status_var = tk.StringVar(value="Status: loading…")
-        status_label = ttk.Label(proxies_frame, textvariable=self.status_var)
+        status_label = ttk.Label(bar, textvariable=self.status_var)
         status_label.pack(side="right", padx=12)
+        self._attach_status_menu(status_label)
+
+    def _build_notebook(self) -> None:
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=8, pady=4)
+        self.notebook = notebook
+
+        jobs_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(jobs_tab, text="Jobs")
+        self._build_jobs_tab(jobs_tab)
+
+        sub_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(sub_tab, text="Subscription")
+        self.sub_tab = sub_tab
+        self._build_subscription_tab(sub_tab)
+
+        proxies_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(proxies_tab, text="Proxies")
+        self._build_proxies_tab(proxies_tab)
+
+    def _build_jobs_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="Start or stop background tasks. Output appears in the log below.",
+        ).pack(anchor="w", pady=(0, 12))
+
+        job_keys = ("scrape", "ping_mtproto", "ping_v2ray")
+        job_hints = {
+            "scrape": "Collect MTProto / V2Ray proxies from Telegram channels.",
+            "ping_mtproto": "Test MTProto servers and update the working catalog.",
+            "ping_v2ray": "Test V2Ray servers and update the working catalog.",
+        }
+        for key in job_keys:
+            spec = self.JOBS[key]
+            row = ttk.Frame(parent)
+            row.pack(fill="x", pady=6)
+            btn = ttk.Button(
+                row,
+                text=self._job_button_start_text(spec),
+                command=lambda k=key: self.toggle_job(k),
+                width=24,
+            )
+            btn.pack(side="left")
+            self.buttons[key] = btn
+            ttk.Label(row, text=job_hints[key], wraplength=520).pack(
+                side="left", padx=(12, 0)
+            )
+
+    def _build_subscription_tab(self, parent: ttk.Frame) -> None:
+        serve_spec = self.JOBS["serve"]
+        serve_row = ttk.Frame(parent)
+        serve_row.pack(fill="x", pady=(0, 12))
+        serve_btn = ttk.Button(
+            serve_row,
+            text=self._job_button_start_text(serve_spec),
+            command=lambda: self.toggle_job("serve"),
+            width=24,
+        )
+        serve_btn.pack(side="left")
+        self.buttons["serve"] = serve_btn
+        ttk.Label(
+            serve_row,
+            text="Serve subscription URLs for NekoRay / v2rayNG on the LAN.",
+            wraplength=520,
+        ).pack(side="left", padx=(12, 0))
 
         self.sub_frame = ttk.LabelFrame(
-            self.root, text="Subscription link", padding=8
+            parent, text="Subscription link", padding=8
         )
+        self.sub_frame.pack(fill="both", expand=True)
         sub_content = ttk.Frame(self.sub_frame)
-        sub_content.pack(fill="x")
+        sub_content.pack(fill="both", expand=True)
 
         sub_left = ttk.Frame(sub_content)
         sub_left.pack(side="left", fill="both", expand=True)
-        ttk.Label(
+        self.sub_placeholder = ttk.Label(
             sub_left,
-            text="Scan the QR code or copy a URL into NekoRay / v2rayNG:",
-        ).pack(anchor="w")
+            text="Start the subscription server to see URLs and a QR code.",
+            foreground="gray",
+        )
+        self.sub_placeholder.pack(anchor="w")
         self.sub_urls_box = tk.Text(
             sub_left,
             height=3,
@@ -150,26 +190,57 @@ class App:
             borderwidth=0,
             highlightthickness=0,
         )
-        self.sub_urls_box.pack(fill="x", pady=(4, 6))
         ttk.Button(
             sub_left, text="Copy LAN URL", command=self._copy_subscription_url
-        ).pack(anchor="w")
+        ).pack(anchor="w", pady=(6, 0))
 
         self.qr_label = ttk.Label(sub_content)
-        self.qr_label.pack(side="right", padx=(12, 0))
         self.qr_missing_label = ttk.Label(
             sub_content,
             text="Install qrcode[pil] to show QR",
             foreground="gray",
         )
 
+    def _build_proxies_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(
+            parent,
+            text="Open working MTProto proxies in Telegram Desktop or copy links.",
+        ).pack(anchor="w", pady=(0, 12))
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=6)
+        ttk.Label(row, text="Open top").pack(side="left")
+        self.top_count = tk.IntVar(value=10)
+        self.top_spin = ttk.Spinbox(
+            row,
+            from_=1,
+            to=50,
+            width=4,
+            textvariable=self.top_count,
+        )
+        self.top_spin.pack(side="left", padx=4)
+        ttk.Button(
+            row,
+            text="proxies in Telegram",
+            command=self.open_top_proxies,
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            row,
+            text="copy 10 links",
+            command=self.copy_top_proxies,
+        ).pack(side="left", padx=4)
+        self._attach_entry_menu(self.top_spin)
+
+    def _build_log_area(self) -> None:
         self.log_wrap = tk.BooleanVar(value=True)
         self.log_autoscroll = tk.BooleanVar(value=True)
         self.log = scrolledtext.ScrolledText(
-            self.root, wrap="word", state="disabled", font=("Consolas", 9)
+            self.root, wrap="word", state="disabled", font=("Consolas", 9), height=12
         )
-        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self._attach_log_menu(self.log)
 
+    def _build_input_bar(self) -> None:
         bottom = ttk.Frame(self.root, padding=(8, 0, 8, 8))
         bottom.pack(fill="x")
         ttk.Label(bottom, text="Input (login code / phone):").pack(side="left")
@@ -177,11 +248,7 @@ class App:
         self.stdin_entry.pack(side="left", fill="x", expand=True, padx=6)
         self.stdin_entry.bind("<Return>", lambda _e: self.send_stdin())
         ttk.Button(bottom, text="Send", command=self.send_stdin).pack(side="left")
-
-        self._attach_log_menu(self.log)
         self._attach_entry_menu(self.stdin_entry)
-        self._attach_entry_menu(self.top_spin)
-        self._attach_status_menu(status_label)
 
     # ------------------------------------------------------- context menus
 
@@ -596,6 +663,8 @@ class App:
             bind_host=bind_host, port=port, filename=filename, config=config
         )
         lines = [f"{label}: {url}" for label, url in self._subscription_urls]
+        self.sub_placeholder.pack_forget()
+        self.sub_urls_box.pack(fill="x", pady=(4, 6))
         self.sub_urls_box.configure(state="normal")
         self.sub_urls_box.delete("1.0", "end")
         self.sub_urls_box.insert("1.0", "\n".join(lines))
@@ -613,18 +682,20 @@ class App:
             self.qr_label.pack_forget()
             self.qr_missing_label.pack(side="right", padx=(12, 0))
 
-        if not self.sub_frame.winfo_ismapped():
-            self.sub_frame.pack(fill="x", padx=8, pady=(0, 4), before=self.log)
+        self.notebook.select(self.sub_tab)
 
     def _hide_subscription_panel(self) -> None:
-        self.sub_frame.pack_forget()
-        self.qr_label.configure(image="")
+        self.sub_urls_box.pack_forget()
+        self.qr_label.pack_forget()
         self.qr_missing_label.pack_forget()
+        self.qr_label.configure(image="")
         self._qr_photo = None
         self._subscription_urls = []
         self.sub_urls_box.configure(state="normal")
         self.sub_urls_box.delete("1.0", "end")
         self.sub_urls_box.configure(state="disabled")
+        if not self.sub_placeholder.winfo_ismapped():
+            self.sub_placeholder.pack(anchor="w")
 
     def _copy_subscription_url(self) -> None:
         if not self._subscription_urls:
