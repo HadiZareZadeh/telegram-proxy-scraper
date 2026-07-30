@@ -17,6 +17,7 @@ from typing import Callable, Literal
 
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import load_config
+from fetch_mtproto.health import hours_since
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_process_tree
 from fetch_mtproto.v2ray.ping import (
     DEFAULT_TEST_TIMEOUT,
@@ -49,6 +50,8 @@ EMPTY_CATALOG_WAIT_SEC = 60.0
 DEFAULT_REUSE_AFTER_ROTATIONS = 5
 DEFAULT_REUSE_AFTER_SEC = 20 * 60
 DEFAULT_MAX_LATENCY_MS = 2000
+# Trust catalog latency for pre-tested servers checked within this window (hours).
+TRUST_CATALOG_MAX_AGE_H = 0.5
 
 
 @dataclass(slots=True)
@@ -124,11 +127,13 @@ class ProxyPoolRunner:
         self._on_status = on_status
         self._on_finished = on_finished
         self._latency_by_key: dict[str, float] = {}
+        self._checked_at_by_key: dict[str, str] = {}
 
         self._thread: threading.Thread | None = None
         self._traffic_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._slots_lock = threading.Lock()
+        self._assigning_slots = False
         self._slots: list[_ProxySlot] = []
         self._servers: list[V2RayServer] = []
         self._recovery_servers: list[V2RayServer] = []
@@ -263,15 +268,33 @@ class ProxyPoolRunner:
                 self._on_finished()
 
     def _refresh_servers(self) -> None:
-        self._servers, primary_latency = self._load_primary_servers()
-        self._recovery_servers, recovery_latency = self._load_recovery_servers()
+        self._servers, primary_latency, primary_checked = self._load_primary_servers()
+        self._recovery_servers, recovery_latency, recovery_checked = (
+            self._load_recovery_servers()
+        )
         self._latency_by_key = {**recovery_latency, **primary_latency}
+        self._checked_at_by_key = {**recovery_checked, **primary_checked}
+
+    def _trust_catalog_latency(
+        self, server: V2RayServer, *, allow_slow: bool, initial: bool
+    ) -> bool:
+        """Skip a live HTTP probe when Ping V2Ray recently verified this server."""
+        if initial or allow_slow:
+            return False
+        lat = self._latency_by_key.get(server.key)
+        if lat is None or lat > self.max_latency_ms:
+            return False
+        checked = self._checked_at_by_key.get(server.key)
+        if not checked:
+            return False
+        return hours_since(checked) <= TRUST_CATALOG_MAX_AGE_H
 
     def _filter_compatible_rows(
         self, rows: list
-    ) -> tuple[list[V2RayServer], dict[str, float]]:
+    ) -> tuple[list[V2RayServer], dict[str, float], dict[str, str]]:
         servers: list[V2RayServer] = []
         latency_by_key: dict[str, float] = {}
+        checked_at_by_key: dict[str, str] = {}
         for row in rows:
             server = _server_from_row(row)
             if server.scheme not in XRAY_SCHEMES:
@@ -284,9 +307,14 @@ class ProxyPoolRunner:
             lat = row["last_latency_ms"]
             if lat is not None:
                 latency_by_key[server.key] = float(lat)
-        return servers, latency_by_key
+            checked = row["last_checked_at"]
+            if checked:
+                checked_at_by_key[server.key] = str(checked)
+        return servers, latency_by_key, checked_at_by_key
 
-    def _load_primary_servers(self) -> tuple[list[V2RayServer], dict[str, float]]:
+    def _load_primary_servers(
+        self,
+    ) -> tuple[list[V2RayServer], dict[str, float], dict[str, str]]:
         """Working servers with catalog latency ≤ max."""
         config = load_config(required=False)
         db, _mt, _v2 = open_catalogs(config)
@@ -305,7 +333,9 @@ class ProxyPoolRunner:
         finally:
             db.close()
 
-    def _load_recovery_servers(self) -> tuple[list[V2RayServer], dict[str, float]]:
+    def _load_recovery_servers(
+        self,
+    ) -> tuple[list[V2RayServer], dict[str, float], dict[str, str]]:
         """All known catalog servers (working first, then history) for live re-test."""
         config = load_config(required=False)
         db, _mt, _v2 = open_catalogs(config)
@@ -551,15 +581,27 @@ class ProxyPoolRunner:
                         f"[{label}]"
                     )
                 allow_slow = label == "catalog"
+                trust_catalog = self._trust_catalog_latency(
+                    server, allow_slow=allow_slow, initial=initial
+                )
                 result = self._restart_slot(
-                    slot, server, allow_slow=allow_slow
+                    slot,
+                    server,
+                    allow_slow=allow_slow,
+                    skip_live_test=trust_catalog,
                 )
                 if result == "ok":
                     latency = self._latency_by_key.get(server.key)
                     latency_txt = (
                         f"{latency:.0f} ms" if latency is not None else "ok"
                     )
-                    if allow_slow and latency is not None and latency > self.max_latency_ms:
+                    if trust_catalog:
+                        self._log(
+                            f"[proxy pool] slot {index + 1}/{self.count}: "
+                            f"validated {server.host}:{server.port} "
+                            f"({latency_txt}, catalog)"
+                        )
+                    elif allow_slow and latency is not None and latency > self.max_latency_ms:
                         self._log(
                             f"[proxy pool] slot {index + 1}/{self.count}: "
                             f"using slow upstream {server.host}:{server.port} "
@@ -619,35 +661,40 @@ class ProxyPoolRunner:
             f"{int(self.reuse_after_sec) // 60} min)"
         )
 
-        blocked: set[str] = set()
-        used: set[str] = set()
-        assigned: list[V2RayServer] = []
+        self._assigning_slots = True
+        try:
+            blocked: set[str] = set()
+            used: set[str] = set()
+            assigned: list[V2RayServer] = []
 
-        for index, slot in enumerate(slots):
-            if self._stop_event.is_set():
-                return
-            # Rotate healthy slots on schedule; always try to fill dead ones.
-            rotate = initial or self._slot_is_healthy(slot)
-            placed = self._fill_slot(
-                index,
-                slot,
-                initial=initial,
-                rotate=rotate,
-                blocked=blocked,
-                used=used,
-                assigned=assigned,
-            )
-            if not placed and rotate:
-                slot.server = None
-                slot.error = "no working upstream found"
-                self._stop_slot(slot)
-                self._log(
-                    f"[proxy pool] slot {index + 1}/{self.count}: "
-                    f"no valid upstream this cycle — will retry"
+            for index, slot in enumerate(slots):
+                if self._stop_event.is_set():
+                    return
+                # Rotate healthy slots on schedule; always try to fill dead ones.
+                rotate = initial or self._slot_is_healthy(slot)
+                placed = self._fill_slot(
+                    index,
+                    slot,
+                    initial=initial,
+                    rotate=rotate,
+                    blocked=blocked,
+                    used=used,
+                    assigned=assigned,
                 )
+                if not placed and rotate:
+                    slot.server = None
+                    slot.error = "no working upstream found"
+                    self._stop_slot(slot)
+                    self._log(
+                        f"[proxy pool] slot {index + 1}/{self.count}: "
+                        f"no valid upstream this cycle — will retry"
+                    )
 
-        if assigned:
-            self._record_usage(assigned)
+            if assigned:
+                self._record_usage(assigned)
+        finally:
+            self._assigning_slots = False
+
         running = sum(1 for slot in slots if self._slot_is_healthy(slot))
         self._log(
             f"[proxy pool] {running}/{len(slots)} slot(s) running with "
@@ -656,6 +703,8 @@ class ProxyPoolRunner:
 
     def _repair_dead_slots(self) -> None:
         """Immediately retry failed or crashed slots without waiting for rotation."""
+        if self._assigning_slots:
+            return
         with self._slots_lock:
             slots = list(self._slots)
         if not slots or not self._candidate_pools():
@@ -696,6 +745,7 @@ class ProxyPoolRunner:
         server: V2RayServer,
         *,
         allow_slow: bool = False,
+        skip_live_test: bool = False,
     ) -> SlotStartResult:
         if self._stop_event.is_set():
             return "failed"
@@ -774,6 +824,16 @@ class ProxyPoolRunner:
         if self._stop_event.is_set():
             self._stop_slot(slot)
             return "failed"
+
+        if skip_live_test:
+            latency_ms = self._latency_by_key.get(server.key, self.max_latency_ms)
+            if latency_ms > self.max_latency_ms and not allow_slow:
+                slot.error = (
+                    f"latency {latency_ms:.0f} ms > {self.max_latency_ms:.0f} ms"
+                )
+                self._stop_slot(slot)
+                return "slow"
+            return "ok"
 
         ok, latency_s, error = self._validate_upstream(slot.http_port)
         if not ok or latency_s is None:
