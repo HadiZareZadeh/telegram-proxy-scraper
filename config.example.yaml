@@ -70,8 +70,8 @@ v2ray:
   decrypt_npvt_attachments: true
 
 scraper:
-  # How often main.py re-pings MTProto + V2Ray catalogs (seconds; 0 = disabled)
-  proxy_check_interval: 1800
+  # Pause between re-ping runs (seconds; starts after each check finishes; 0 = disabled)
+  proxy_check_interval: 300
   # Pause before reconnecting after a dropped Telegram connection (seconds)
   reconnect_delay: 5
 
