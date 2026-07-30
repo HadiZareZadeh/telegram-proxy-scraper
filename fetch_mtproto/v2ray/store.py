@@ -7,11 +7,14 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from fetch_mtproto.db import CatalogDB
 from fetch_mtproto.v2ray.subscription import write_subscription
+
+if TYPE_CHECKING:
+    from fetch_mtproto.prune import PruneSettings
 
 # Common share-link schemes used with V2Ray / Xray clients
 V2RAY_SCHEMES = (
@@ -400,12 +403,14 @@ class V2RayCatalog:
         schemes: tuple[str, ...] = V2RAY_SCHEMES,
         max_working: int | None = None,
         subscription_limit: int | None = 100,
+        prune_settings: PruneSettings | None = None,
     ) -> None:
         self.db = db
         self.schemes = schemes
         self.subscription_path = Path(subscription_path)
         self.max_working = max_working
         self.subscription_limit = subscription_limit
+        self.prune_settings = prune_settings
         self.working: dict[str, _V2RayView] = {
             scheme: _V2RayView(db, scheme, "working") for scheme in schemes
         }
@@ -436,15 +441,31 @@ class V2RayCatalog:
         *,
         respect_backoff: bool = True,
         limit: int | None = None,
+        failed_limit: int | None = None,
     ) -> list[V2RayServer]:
         """Ordered probe list: most successful / freshest / unexplored first."""
         return [
             server
             for row in self.db.v2ray_probe_queue(
-                respect_backoff=respect_backoff, limit=limit
+                respect_backoff=respect_backoff,
+                limit=limit,
+                failed_limit=failed_limit,
             )
             if is_nekoray_compatible(server := _server_from_row(row))
         ]
+
+    def prune_stale(self) -> dict[str, int]:
+        if self.prune_settings is None or not self.prune_settings.enabled:
+            return {
+                "chronic": 0,
+                "stale": 0,
+                "cap": 0,
+                "incompatible": 0,
+                "total": 0,
+            }
+        from fetch_mtproto.prune import prune_v2ray
+
+        return prune_v2ray(self.db, self.prune_settings)
 
     def counts(self) -> tuple[int, int]:
         return self.db.v2ray_count("working"), self.db.v2ray_count("failed")
@@ -497,6 +518,7 @@ class V2RayCatalog:
                 fail_n += 1
         self.db.v2ray_record_results(outcomes)
         self.enforce_max_working()
+        self.prune_stale()
         self.update_subscription()
         return ok_n, fail_n
 

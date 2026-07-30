@@ -5,10 +5,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from fetch_mtproto.db import CatalogDB
+
+if TYPE_CHECKING:
+    from fetch_mtproto.prune import PruneSettings
 
 # tg://proxy?...  or  https://t.me/proxy?...  (also telegram.me)
 _PROXY_URL_RE = re.compile(
@@ -205,9 +208,16 @@ class _MtprotoView:
 class ProxyCatalog:
     """Working + failed MTProto proxies stored in SQLite."""
 
-    def __init__(self, db: CatalogDB, *, max_working: int | None = None) -> None:
+    def __init__(
+        self,
+        db: CatalogDB,
+        *,
+        max_working: int | None = None,
+        prune_settings: PruneSettings | None = None,
+    ) -> None:
         self.db = db
         self.max_working = max_working
+        self.prune_settings = prune_settings
         self.working = _MtprotoView(db, "working")
         self.failed = _MtprotoView(db, "failed")
         self.enforce_max_working()
@@ -234,14 +244,24 @@ class ProxyCatalog:
         *,
         respect_backoff: bool = True,
         limit: int | None = None,
+        failed_limit: int | None = None,
     ) -> list[MTProtoProxy]:
         """Ordered probe list: most successful / freshest / unexplored first."""
         return [
             _proxy_from_row(row)
             for row in self.db.mtproto_probe_queue(
-                respect_backoff=respect_backoff, limit=limit
+                respect_backoff=respect_backoff,
+                limit=limit,
+                failed_limit=failed_limit,
             )
         ]
+
+    def prune_stale(self) -> dict[str, int]:
+        if self.prune_settings is None or not self.prune_settings.enabled:
+            return {"chronic": 0, "stale": 0, "cap": 0, "total": 0}
+        from fetch_mtproto.prune import prune_mtproto
+
+        return prune_mtproto(self.db, self.prune_settings)
 
     def add(self, proxies: Iterable[MTProtoProxy]) -> int:
         """Add newly discovered proxies as working (and drop from failed)."""
@@ -279,6 +299,7 @@ class ProxyCatalog:
                 fail_n += 1
         self.db.mtproto_record_results(outcomes)
         self.enforce_max_working()
+        self.prune_stale()
         return ok_n, fail_n
 
     def reorganize(

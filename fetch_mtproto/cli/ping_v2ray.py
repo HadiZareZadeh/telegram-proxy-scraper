@@ -8,6 +8,7 @@ import sys
 from fetch_mtproto.cancel import CancelScope
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import load_config
+from fetch_mtproto.prune import probe_kwargs_from_config
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
 from fetch_mtproto.v2ray.port_cleanup import cleanup_ping_xray
 from fetch_mtproto.v2ray.settings import v2ray_test_kwargs
@@ -25,9 +26,7 @@ def _print_fastest(fastest) -> None:
 
 
 def _probe_kwargs(config) -> dict:
-    return {
-        "respect_backoff": bool(getattr(config, "PROBE_RESPECT_BACKOFF", True)),
-    }
+    return probe_kwargs_from_config(config)
 
 
 def _print_run_summary(stats, summary) -> None:
@@ -79,7 +78,8 @@ async def run(config, best: list) -> None:
             f"{kwargs['base_port'] + kwargs['concurrency'] - 1}  "
             f"timeout={kwargs['timeout']}s\n"
             f"Order: highest priority_score first "
-            f"(backoff={'on' if probe_kw['respect_backoff'] else 'off'})\n"
+            f"(backoff={'on' if probe_kw['respect_backoff'] else 'off'}"
+            f"{f', failed cap={probe_kw['failed_limit']}' if probe_kw.get('failed_limit') else ''})\n"
         )
         killed = cleanup_ping_xray(
             base_port=kwargs["base_port"],

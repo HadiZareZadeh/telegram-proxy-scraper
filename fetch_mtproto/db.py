@@ -185,6 +185,7 @@ class CatalogDB:
         *,
         respect_backoff: bool = True,
         limit: int | None = None,
+        failed_limit: int | None = None,
     ) -> list[sqlite3.Row]:
         """Servers to probe, most promising first (explore / exploit / recover)."""
         rows = list(
@@ -201,9 +202,67 @@ class CatalogDB:
             ]
             # If backoff would empty the queue, fall back to full ordered list
             rows = eligible or rows
+        rows = self._apply_probe_failed_limit(rows, failed_limit)
         if limit is not None and limit > 0:
             rows = rows[:limit]
         return rows
+
+    @staticmethod
+    def _apply_probe_failed_limit(
+        rows: list[sqlite3.Row], failed_limit: int | None
+    ) -> list[sqlite3.Row]:
+        """Always probe working servers; cap how many failed entries are retried."""
+        if failed_limit is None or failed_limit <= 0:
+            return rows
+        working = [row for row in rows if row["status"] == "working"]
+        failed = [row for row in rows if row["status"] == "failed"]
+        return working + failed[:failed_limit]
+
+    def mtproto_prune(
+        self,
+        *,
+        after_failures: int = 8,
+        min_checks: int = 5,
+        stale_days: int = 14,
+        max_failed: int = 0,
+    ) -> dict[str, int]:
+        """Delete chronic / stale failed MTProto proxies; trim failed over max_failed."""
+        chronic = stale = cap = 0
+
+        if after_failures > 0 and min_checks > 0:
+            cur = self.conn.execute(
+                """
+                DELETE FROM mtproto
+                WHERE status = 'failed'
+                  AND consecutive_failures >= ?
+                  AND check_count >= ?
+                  AND success_count = 0
+                """,
+                (after_failures, min_checks),
+            )
+            chronic = cur.rowcount
+
+        if stale_days > 0:
+            cur = self.conn.execute(
+                """
+                DELETE FROM mtproto
+                WHERE status = 'failed'
+                  AND consecutive_failures >= 3
+                  AND last_checked_at IS NOT NULL
+                  AND datetime(last_checked_at) < datetime('now', ?)
+                """,
+                (f"-{int(stale_days)} days",),
+            )
+            stale = cur.rowcount
+
+        if max_failed > 0:
+            cap = self._trim_failed_rows("mtproto", max_failed)
+
+        self.conn.commit()
+        if chronic or stale or cap:
+            self._mtproto_refresh_sort_orders()
+        total = chronic + stale + cap
+        return {"chronic": chronic, "stale": stale, "cap": cap, "total": total}
 
     def mtproto_upsert_working(self, rows: Iterable[tuple]) -> int:
         """Insert proxies as working; promote from failed. Returns newly added count."""
@@ -547,6 +606,7 @@ class CatalogDB:
         *,
         respect_backoff: bool = True,
         limit: int | None = None,
+        failed_limit: int | None = None,
     ) -> list[sqlite3.Row]:
         rows = list(
             self.conn.execute(
@@ -561,9 +621,103 @@ class CatalogDB:
                 if is_probe_eligible(HealthSnapshot.from_row(row), now=now)
             ]
             rows = eligible or rows
+        rows = self._apply_probe_failed_limit(rows, failed_limit)
         if limit is not None and limit > 0:
             rows = rows[:limit]
         return rows
+
+    def _trim_failed_rows(self, table: str, max_failed: int) -> int:
+        count_row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE status = 'failed'"
+        ).fetchone()
+        failed_count = int(count_row["n"])
+        if failed_count <= max_failed:
+            return 0
+        excess = failed_count - max_failed
+        keys = self.conn.execute(
+            f"""
+            SELECT key FROM {table}
+            WHERE status = 'failed'
+            ORDER BY priority_score ASC,
+                     CASE WHEN last_checked_at IS NULL THEN 1 ELSE 0 END,
+                     last_checked_at ASC,
+                     key
+            LIMIT ?
+            """,
+            (excess,),
+        ).fetchall()
+        if not keys:
+            return 0
+        placeholders = ",".join("?" * len(keys))
+        cur = self.conn.execute(
+            f"DELETE FROM {table} WHERE key IN ({placeholders})",
+            tuple(row["key"] for row in keys),
+        )
+        return cur.rowcount
+
+    def v2ray_prune(
+        self,
+        *,
+        after_failures: int = 8,
+        min_checks: int = 5,
+        stale_days: int = 14,
+        max_failed: int = 0,
+        incompatible_networks: tuple[str, ...] = (),
+    ) -> dict[str, int]:
+        """Delete chronic / stale / incompatible failed V2Ray servers."""
+        chronic = stale = cap = incompatible = 0
+
+        if incompatible_networks:
+            placeholders = ",".join("?" * len(incompatible_networks))
+            cur = self.conn.execute(
+                f"""
+                DELETE FROM v2ray
+                WHERE lower(network) IN ({placeholders})
+                """,
+                tuple(net.lower() for net in incompatible_networks),
+            )
+            incompatible = cur.rowcount
+
+        if after_failures > 0 and min_checks > 0:
+            cur = self.conn.execute(
+                """
+                DELETE FROM v2ray
+                WHERE status = 'failed'
+                  AND consecutive_failures >= ?
+                  AND check_count >= ?
+                  AND success_count = 0
+                """,
+                (after_failures, min_checks),
+            )
+            chronic = cur.rowcount
+
+        if stale_days > 0:
+            cur = self.conn.execute(
+                """
+                DELETE FROM v2ray
+                WHERE status = 'failed'
+                  AND consecutive_failures >= 3
+                  AND last_checked_at IS NOT NULL
+                  AND datetime(last_checked_at) < datetime('now', ?)
+                """,
+                (f"-{int(stale_days)} days",),
+            )
+            stale = cur.rowcount
+
+        if max_failed > 0:
+            cap = self._trim_failed_rows("v2ray", max_failed)
+
+        self.conn.commit()
+        if chronic or stale or cap or incompatible:
+            self._v2ray_refresh_sort_orders()
+        total = chronic + stale + cap + incompatible
+        return {
+            "chronic": chronic,
+            "stale": stale,
+            "cap": cap,
+            "incompatible": incompatible,
+            "total": total,
+        }
 
     def v2ray_upsert_working(self, rows: Iterable[tuple]) -> int:
         added = 0

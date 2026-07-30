@@ -22,6 +22,7 @@ from fetch_mtproto.scraper.client import (
 )
 from fetch_mtproto.scraper.ingest import ingest_message
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
+from fetch_mtproto.prune import probe_kwargs_from_config
 from fetch_mtproto.v2ray.settings import ingest_subscription_kwargs, v2ray_test_kwargs
 from fetch_mtproto.v2ray.store import V2RayCatalog
 
@@ -328,9 +329,8 @@ async def periodic_checks(
         concurrency = getattr(config, "PING_CONCURRENCY", 20)
         timeout = getattr(config, "PING_TIMEOUT", 8.0)
         v2_kwargs = v2ray_test_kwargs(config)
-        respect_backoff = bool(getattr(config, "PROBE_RESPECT_BACKOFF", True))
-        mt_probe_kw = {"respect_backoff": respect_backoff}
-        v2_probe_kw = {"respect_backoff": respect_backoff}
+        mt_probe_kw = probe_kwargs_from_config(config)
+        v2_probe_kw = probe_kwargs_from_config(config)
 
         def _mt_progress(done: int, total_n: int, result) -> None:
             if result.ok and result.latency is not None:

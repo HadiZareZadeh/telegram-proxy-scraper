@@ -350,13 +350,16 @@ async def check_and_reorganize_v2ray(
     xray_bin: str | None = None,
     on_result=None,
     respect_backoff: bool = True,
+    failed_limit: int | None = None,
     cancel_event: asyncio.Event | None = None,
 ) -> V2RayReorganizeStats:
     workers = clamp_ping_concurrency(concurrency)
     cleaned = cleanup_ping_xray(base_port=base_port, concurrency=workers)
 
     if hasattr(catalog, "probe_queue"):
-        servers = catalog.probe_queue(respect_backoff=respect_backoff)
+        servers = catalog.probe_queue(
+            respect_backoff=respect_backoff, failed_limit=failed_limit
+        )
     else:
         servers = catalog.all_unique()
     if not servers:

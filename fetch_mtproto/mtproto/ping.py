@@ -344,11 +344,14 @@ async def check_and_reorganize(
     timeout: float = 8.0,
     on_result=None,
     respect_backoff: bool = True,
+    failed_limit: int | None = None,
     cancel_event: asyncio.Event | None = None,
 ) -> ReorganizeStats:
     """Ping the adaptive probe queue and update health stats + working/failed."""
     if hasattr(catalog, "probe_queue"):
-        proxies = catalog.probe_queue(respect_backoff=respect_backoff)
+        proxies = catalog.probe_queue(
+            respect_backoff=respect_backoff, failed_limit=failed_limit
+        )
     else:
         proxies = catalog.all_unique()
     if not proxies:

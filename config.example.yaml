@@ -85,6 +85,13 @@ probe:
   # Adaptive probe scheduler (explore / exploit / recover)
   # Skip chronic failures until their backoff window expires.
   respect_backoff: true
+  # Drop dead servers so ping runs stay fast (applied after each check + at startup)
+  prune_after_failures: 8      # consecutive failures with zero lifetime successes
+  prune_min_checks: 5          # minimum probes before a server can be pruned
+  prune_stale_days: 14         # remove failed servers not checked in this many days
+  max_failed: 2000             # cap failed rows kept in DB (0 = unlimited)
+  failed_limit: 500            # max failed servers to re-probe per run (0 = unlimited; working always probed)
+  prune_incompatible_v2ray: true  # delete xhttp / splithttp / raw (Nekoray-incompatible)
 
 proxy_pool:
   # Local SOCKS5+HTTP slots for emulators / other tools (Proxy pool tab)

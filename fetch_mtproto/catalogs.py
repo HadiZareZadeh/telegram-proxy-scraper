@@ -9,6 +9,7 @@ from fetch_mtproto.config_loader import resolve_max_working, resolve_subscriptio
 from fetch_mtproto.db import CatalogDB
 from fetch_mtproto.mtproto.store import ProxyCatalog, load_mtproto_from_text_file
 from fetch_mtproto.paths import PROJECT_ROOT
+from fetch_mtproto.prune import prune_settings_from_config, prune_mtproto, prune_v2ray
 from fetch_mtproto.v2ray.store import V2RAY_SCHEMES, V2RayCatalog, load_v2ray_from_text_file
 
 log = logging.getLogger("mtproto-scraper")
@@ -110,11 +111,18 @@ def open_catalogs(config_module=None) -> tuple[CatalogDB, ProxyCatalog, V2RayCat
         v2_sub_limit = resolve_subscription_limit(
             getattr(config_module, "V2RAY_SUBSCRIPTION_LIMIT", None)
         )
-    mt_catalog = ProxyCatalog(db, max_working=mt_max)
+    prune_settings = prune_settings_from_config(config_module)
+    mt_catalog = ProxyCatalog(db, max_working=mt_max, prune_settings=prune_settings)
     v2_catalog = V2RayCatalog(
         db,
         subscription_path=subscription_path(config_module),
         max_working=v2_max,
         subscription_limit=v2_sub_limit,
+        prune_settings=prune_settings,
     )
+    if prune_settings.enabled:
+        mt_pruned = prune_mtproto(db, prune_settings)
+        v2_pruned = prune_v2ray(db, prune_settings)
+        if mt_pruned["total"] or v2_pruned["total"]:
+            v2_catalog.update_subscription()
     return db, mt_catalog, v2_catalog
