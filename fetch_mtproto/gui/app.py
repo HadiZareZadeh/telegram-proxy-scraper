@@ -1461,8 +1461,29 @@ class App:
         self.log_line(
             "Scraper login: when prompted, type phone / code below and press Send."
         )
+        self._cleanup_stale_xray_on_startup()
         self._schedule_auto_start_jobs()
         self.root.mainloop()
+
+    def _cleanup_stale_xray_on_startup(self) -> None:
+        from fetch_mtproto.config_loader import load_config
+        from fetch_mtproto.v2ray.port_cleanup import cleanup_owned_xray_from_config
+
+        config = load_config(required=False)
+        if not config:
+            return
+        try:
+            result = cleanup_owned_xray_from_config(config)
+        except Exception as exc:
+            self.log_line(f"[startup] xray port cleanup failed: {exc}")
+            return
+        ping_n = len(result.get("ping") or [])
+        pool_n = len(result.get("pool") or [])
+        if ping_n or pool_n:
+            self.log_line(
+                f"[startup] cleared leftover xray: "
+                f"{ping_n} on ping ports, {pool_n} on proxy-pool ports"
+            )
 
 
 def main() -> None:

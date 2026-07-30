@@ -15,7 +15,11 @@ from urllib.parse import urlparse
 from python_socks.async_.asyncio import Proxy
 
 from fetch_mtproto.paths import PROJECT_ROOT, XRAY_DIR
-from fetch_mtproto.process_tree import hide_console_kwargs
+from fetch_mtproto.process_tree import hide_console_kwargs, kill_pid_tree
+from fetch_mtproto.v2ray.port_cleanup import (
+    DEFAULT_PING_BASE_PORT,
+    cleanup_ping_xray,
+)
 from fetch_mtproto.v2ray.store import V2RayCatalog, V2RayServer
 from fetch_mtproto.v2ray.xray import build_xray_config, dumps_config, link_to_xray_outbound
 
@@ -25,6 +29,7 @@ ROOT = PROJECT_ROOT
 DEFAULT_TEST_URL = "http://www.gstatic.com/generate_204"
 DEFAULT_TEST_BYTES = 0
 DEFAULT_TEST_TIMEOUT = 8.0
+DEFAULT_PING_CONCURRENCY = 20
 
 
 @dataclass(slots=True)
@@ -68,30 +73,48 @@ def resolve_xray_bin(explicit: str | None = None) -> str | None:
     return None
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def clamp_ping_concurrency(value: int) -> int:
+    """Keep concurrency in a sane range."""
+    try:
+        concurrency = int(value)
+    except (TypeError, ValueError):
+        concurrency = DEFAULT_PING_CONCURRENCY
+    return max(1, min(concurrency, 64))
+
+
+def _port_is_open(host: str, port: int, *, timeout: float = 0.2) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 async def _wait_port(host: str, port: int, timeout: float) -> None:
+    """Poll until the local port accepts TCP (avoids asyncio connection spam)."""
+    loop = asyncio.get_running_loop()
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=0.25,
-            )
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            _ = reader
+        if await loop.run_in_executor(None, _port_is_open, host, port):
             return
-        except Exception:
-            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)
     raise TimeoutError(f"Xray SOCKS port {port} did not open")
+
+
+async def _kill_xray_proc(proc: asyncio.subprocess.Process | None) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        kill_pid_tree(proc.pid, timeout=3.0)
+    except Exception:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=3.0)
+    except Exception:
+        pass
 
 
 async def _ping_via_socks(
@@ -165,6 +188,7 @@ async def _ping_via_socks(
 async def ping_v2ray(
     server: V2RayServer,
     *,
+    socks_port: int,
     timeout: float = DEFAULT_TEST_TIMEOUT,
     test_url: str = DEFAULT_TEST_URL,
     test_bytes: int = DEFAULT_TEST_BYTES,
@@ -186,7 +210,6 @@ async def ping_v2ray(
             error="xray binary not found (set xray.bin in config.yaml, install xray on PATH, or run setup to install it in xray/)",
         )
 
-    socks_port = _free_port()
     config = build_xray_config(outbound, socks_port)
     cfg_path = None
     proc = None
@@ -201,13 +224,14 @@ async def ping_v2ray(
             handle.write(dumps_config(config))
             cfg_path = handle.name
 
+        # DEVNULL avoids pipe-handle exhaustion under high concurrency on Windows.
         proc = await asyncio.create_subprocess_exec(
             bin_path,
             "run",
             "-c",
             cfg_path,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
             **hide_console_kwargs(),
         )
         await _wait_port("127.0.0.1", socks_port, timeout=min(8.0, timeout))
@@ -220,24 +244,9 @@ async def ping_v2ray(
         return V2RayPingResult(server=server, latency=latency, bytes_read=nbytes)
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
-        if proc is not None and proc.stderr is not None:
-            try:
-                err = await asyncio.wait_for(proc.stderr.read(500), timeout=0.2)
-                if err:
-                    detail = f"{detail}; xray: {err.decode(errors='replace').strip()}"
-            except Exception:
-                pass
         return V2RayPingResult(server=server, latency=None, error=detail)
     finally:
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except Exception:
-                pass
+        await _kill_xray_proc(proc)
         if cfg_path:
             try:
                 os.unlink(cfg_path)
@@ -248,7 +257,8 @@ async def ping_v2ray(
 async def ping_v2ray_servers(
     servers: list[V2RayServer],
     *,
-    concurrency: int = 10,
+    concurrency: int = DEFAULT_PING_CONCURRENCY,
+    base_port: int = DEFAULT_PING_BASE_PORT,
     timeout: float = DEFAULT_TEST_TIMEOUT,
     test_url: str = DEFAULT_TEST_URL,
     test_bytes: int = DEFAULT_TEST_BYTES,
@@ -261,54 +271,60 @@ async def ping_v2ray_servers(
     if not servers:
         return []
 
-    sem = asyncio.Semaphore(concurrency)
+    workers = clamp_ping_concurrency(concurrency)
     results: list[V2RayPingResult] = []
     lock = asyncio.Lock()
     working_keys: set[str] = set(initial_working_keys or ())
     done = 0
+    next_index = 0
     total = len(servers)
 
-    async def _one(server: V2RayServer) -> None:
-        nonlocal done
-        if cancel_event and cancel_event.is_set():
-            return
-        async with lock:
-            if cancel_event and cancel_event.is_set():
-                return
-            if (
-                max_working is not None
-                and len(working_keys) >= max_working
-                and server.key not in working_keys
-            ):
-                return
-        async with sem:
+    async def _worker(worker_id: int) -> None:
+        nonlocal done, next_index
+        socks_port = int(base_port) + worker_id
+        while True:
             async with lock:
                 if cancel_event and cancel_event.is_set():
                     return
-                if (
-                    max_working is not None
-                    and len(working_keys) >= max_working
-                    and server.key not in working_keys
-                ):
-                    return
+                while True:
+                    if next_index >= total:
+                        return
+                    if (
+                        max_working is not None
+                        and len(working_keys) >= max_working
+                    ):
+                        while (
+                            next_index < total
+                            and servers[next_index].key not in working_keys
+                        ):
+                            next_index += 1
+                        if next_index >= total:
+                            return
+                    server = servers[next_index]
+                    next_index += 1
+                    break
+
             result = await ping_v2ray(
                 server,
+                socks_port=socks_port,
                 timeout=timeout,
                 test_url=test_url,
                 test_bytes=test_bytes,
                 xray_bin=xray_bin,
             )
-        async with lock:
-            done += 1
-            if result.ok and result.latency is not None:
-                working_keys.add(server.key)
-            else:
-                working_keys.discard(server.key)
-            results.append(result)
-            if on_result:
-                on_result(done, total, result)
+            async with lock:
+                done += 1
+                if result.ok and result.latency is not None:
+                    working_keys.add(server.key)
+                else:
+                    working_keys.discard(server.key)
+                results.append(result)
+                if on_result:
+                    on_result(done, total, result)
 
-    await asyncio.gather(*(_one(s) for s in servers))
+    await asyncio.gather(
+        *(_worker(worker_id) for worker_id in range(min(workers, total)))
+    )
     return results
 
 
@@ -320,12 +336,14 @@ class V2RayReorganizeStats:
     checked: int = 0
     total: int = 0
     cancelled: bool = False
+    cleaned_pids: list[int] | None = None
 
 
 async def check_and_reorganize_v2ray(
     catalog: V2RayCatalog,
     *,
-    concurrency: int = 10,
+    concurrency: int = DEFAULT_PING_CONCURRENCY,
+    base_port: int = DEFAULT_PING_BASE_PORT,
     timeout: float = DEFAULT_TEST_TIMEOUT,
     test_url: str = DEFAULT_TEST_URL,
     test_bytes: int = DEFAULT_TEST_BYTES,
@@ -334,12 +352,15 @@ async def check_and_reorganize_v2ray(
     respect_backoff: bool = True,
     cancel_event: asyncio.Event | None = None,
 ) -> V2RayReorganizeStats:
+    workers = clamp_ping_concurrency(concurrency)
+    cleaned = cleanup_ping_xray(base_port=base_port, concurrency=workers)
+
     if hasattr(catalog, "probe_queue"):
         servers = catalog.probe_queue(respect_backoff=respect_backoff)
     else:
         servers = catalog.all_unique()
     if not servers:
-        return V2RayReorganizeStats(0, 0, None)
+        return V2RayReorganizeStats(0, 0, None, cleaned_pids=cleaned)
 
     total = len(servers)
     max_working = catalog.max_working
@@ -351,7 +372,8 @@ async def check_and_reorganize_v2ray(
 
     results = await ping_v2ray_servers(
         servers,
-        concurrency=concurrency,
+        concurrency=workers,
+        base_port=base_port,
         timeout=timeout,
         test_url=test_url,
         test_bytes=test_bytes,
@@ -382,6 +404,7 @@ async def check_and_reorganize_v2ray(
             checked=checked,
             total=total,
             cancelled=cancelled,
+            cleaned_pids=cleaned,
         )
 
     ok_ranked = []
@@ -403,4 +426,5 @@ async def check_and_reorganize_v2ray(
         checked=checked,
         total=total,
         cancelled=cancelled,
+        cleaned_pids=cleaned,
     )

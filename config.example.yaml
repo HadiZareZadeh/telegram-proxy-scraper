@@ -52,6 +52,9 @@ v2ray:
   test_bytes: 0
   test_timeout: 8.0
   ping_concurrency: 20
+  # Local SOCKS ports for Ping V2Ray workers: base .. base+concurrency-1
+  # Kept far from proxy_pool.start_port so leftovers can be killed by range.
+  ping_base_port: 45001
   # Stop probing once this many working servers are found (0 = unlimited)
   max_working: 300
   # Fastest, most recently checked working servers exported to subscription.txt (0 = unlimited)

@@ -16,6 +16,16 @@ def hide_console_kwargs() -> dict:
     return {}
 
 
+def kill_pid_tree(pid: int, *, timeout: float = 5.0) -> None:
+    """Stop a process id and every process it spawned."""
+    if pid <= 0:
+        return
+    if sys.platform == "win32":
+        _kill_tree_windows(pid)
+    else:
+        _kill_tree_unix(pid, timeout=min(timeout, 3.0))
+
+
 def kill_process_tree(
     process: subprocess.Popen,
     *,
@@ -25,11 +35,7 @@ def kill_process_tree(
     if process.poll() is not None:
         return
 
-    pid = process.pid
-    if sys.platform == "win32":
-        _kill_tree_windows(pid)
-    else:
-        _kill_tree_unix(pid, timeout=min(timeout, 3.0))
+    kill_pid_tree(process.pid, timeout=timeout)
 
     try:
         process.wait(timeout=timeout)

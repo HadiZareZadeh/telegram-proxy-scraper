@@ -23,6 +23,7 @@ from fetch_mtproto.v2ray.ping import (
     DEFAULT_TEST_URL,
     resolve_xray_bin,
 )
+from fetch_mtproto.v2ray.port_cleanup import cleanup_pool_xray
 from fetch_mtproto.v2ray.store import V2RayServer, _server_from_row, is_nekoray_compatible
 from fetch_mtproto.v2ray.xray import (
     XRAY_SCHEMES,
@@ -183,6 +184,13 @@ class ProxyPoolRunner:
                     "[proxy pool] xray binary not found — run setup or set xray.bin in config.yaml"
                 )
                 return
+
+            killed = cleanup_pool_xray(start_port=self.start_port, count=self.count)
+            if killed:
+                self._log(
+                    f"[proxy pool] cleared {len(killed)} leftover xray process(es) "
+                    f"on pool ports {self.start_port}+"
+                )
 
             self._refresh_servers()
             if not self._servers:

@@ -34,6 +34,7 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("v2ray", "test_bytes", "V2RAY_TEST_BYTES"),
     ("v2ray", "test_timeout", "V2RAY_TEST_TIMEOUT"),
     ("v2ray", "ping_concurrency", "V2RAY_PING_CONCURRENCY"),
+    ("v2ray", "ping_base_port", "V2RAY_PING_BASE_PORT"),
     ("scraper", "proxy_check_interval", "PROXY_CHECK_INTERVAL"),
     ("scraper", "reconnect_delay", "RECONNECT_DELAY"),
     ("mtproto", "ping_concurrency", "PING_CONCURRENCY"),

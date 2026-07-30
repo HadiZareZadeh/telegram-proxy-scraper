@@ -9,6 +9,7 @@ from fetch_mtproto.cancel import CancelScope
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import load_config
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
+from fetch_mtproto.v2ray.port_cleanup import cleanup_ping_xray
 from fetch_mtproto.v2ray.settings import v2ray_test_kwargs
 
 
@@ -73,9 +74,22 @@ async def run(config, best: list) -> None:
             f"(working={working}, failed={failed}; "
             f"lifetime ok={summary['successes']} fail={summary['failures']})\n"
             f"via {kwargs['test_url']} through {kwargs['xray_bin']}\n"
+            f"concurrency={kwargs['concurrency']}  "
+            f"ports={kwargs['base_port']}–"
+            f"{kwargs['base_port'] + kwargs['concurrency'] - 1}  "
+            f"timeout={kwargs['timeout']}s\n"
             f"Order: highest priority_score first "
             f"(backoff={'on' if probe_kw['respect_backoff'] else 'off'})\n"
         )
+        killed = cleanup_ping_xray(
+            base_port=kwargs["base_port"],
+            concurrency=kwargs["concurrency"],
+        )
+        if killed:
+            print(
+                f"Cleared {len(killed)} leftover xray process(es) "
+                f"on ping ports {kwargs['base_port']}+.\n"
+            )
 
         def on_result(done: int, total: int, result) -> None:
             label = f"{result.server.scheme}://{result.server.host}:{result.server.port}"
@@ -111,6 +125,23 @@ def main() -> None:
         print("\nInterrupted.")
         print()
         _print_fastest(best[0])
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        # WinError 10055: system out of socket buffer / ephemeral ports.
+        if winerror == 10055 or getattr(exc, "errno", None) in {55, 1055}:
+            print(
+                "\nWindows ran out of network sockets (WinError 10055).\n"
+                "Usually caused by too many Xray processes or a prior ping/pool run.\n"
+                "Try:\n"
+                "  1. Stop the proxy pool in the GUI\n"
+                "  2. Restart the control panel (clears leftover xray on ping/pool ports)\n"
+                "  3. Wait ~1–2 minutes for ports to free (TIME_WAIT)\n"
+                "  4. Lower v2ray.ping_concurrency in config.yaml (e.g. 6–8)\n"
+                "  5. Run Ping V2Ray again\n",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
     if sys.stdin.isatty():
         input("\nPress Enter to exit…")
 
