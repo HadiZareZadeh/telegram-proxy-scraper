@@ -263,3 +263,88 @@ def update_config_values(updates: Mapping[str, Mapping[str, Any]]) -> Path:
 
     _CONFIG_PATH.write_text("".join(out), encoding="utf-8")
     return _CONFIG_PATH
+
+
+_LIST_ITEM_RE = re.compile(r"^\s+-\s+")
+
+
+def update_config_lists(updates: Mapping[str, Mapping[str, list[str]]]) -> Path:
+    """Replace YAML list keys (e.g. telegram.sources) while preserving comments."""
+    if not updates:
+        return _CONFIG_PATH
+
+    if _CONFIG_PATH.is_file():
+        original = _CONFIG_PATH.read_text(encoding="utf-8")
+    else:
+        original = ""
+
+    pending: dict[tuple[str, str], list[str]] = {}
+    for section, keys in updates.items():
+        for key, items in keys.items():
+            pending[(section, key)] = list(items)
+
+    lines = original.splitlines(keepends=True)
+    current_section: str | None = None
+    out: list[str] = []
+    skipping_list = False
+
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped and not stripped.startswith("#") and line[:1] not in " \t":
+            section_match = _SECTION_RE.match(line)
+            if section_match:
+                current_section = section_match.group(1)
+                skipping_list = False
+                out.append(line)
+                continue
+
+        if skipping_list:
+            if _LIST_ITEM_RE.match(line):
+                continue
+            if _KEY_RE.match(line):
+                skipping_list = False
+            else:
+                continue
+
+        key_match = _KEY_RE.match(line)
+        if (
+            key_match
+            and current_section
+            and (current_section, key_match.group(2)) in pending
+        ):
+            indent, key = key_match.group(1), key_match.group(2)
+            items = pending.pop((current_section, key))
+            comment = ""
+            hash_at = line.find("#")
+            if hash_at >= 0:
+                before = line[:hash_at]
+                if before.count('"') % 2 == 0 and before.count("'") % 2 == 0:
+                    comment = "  " + line[hash_at:].rstrip("\r\n")
+            if line.endswith("\r\n"):
+                newline = "\r\n"
+            elif line.endswith("\n"):
+                newline = "\n"
+            else:
+                newline = "\n"
+            out.append(f"{indent}{key}:{comment}{newline}")
+            item_indent = indent + "  "
+            for item in items:
+                out.append(f"{item_indent}- {_yaml_scalar(item)}\n")
+            skipping_list = True
+            continue
+
+        out.append(line)
+
+    _CONFIG_PATH.write_text("".join(out), encoding="utf-8")
+    return _CONFIG_PATH
+
+
+def save_gui_config(
+    scalars: Mapping[str, Mapping[str, Any]],
+    lists: Mapping[str, Mapping[str, list[str]]] | None = None,
+) -> Path:
+    """Persist scalar and list config updates from the GUI."""
+    update_config_values(scalars)
+    if lists:
+        update_config_lists(lists)
+    return _CONFIG_PATH
