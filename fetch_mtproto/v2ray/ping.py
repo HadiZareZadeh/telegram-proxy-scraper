@@ -21,7 +21,11 @@ from fetch_mtproto.v2ray.port_cleanup import (
     cleanup_ping_xray,
 )
 from fetch_mtproto.v2ray.store import V2RayCatalog, V2RayServer
-from fetch_mtproto.v2ray.xray import build_xray_config, dumps_config, link_to_xray_outbound
+from fetch_mtproto.v2ray.xray import (
+    build_xray_ping_batch_config,
+    dumps_config,
+    link_to_xray_outbound,
+)
 
 ROOT = PROJECT_ROOT
 
@@ -74,7 +78,7 @@ def resolve_xray_bin(explicit: str | None = None) -> str | None:
 
 
 def clamp_ping_concurrency(value: int) -> int:
-    """Keep concurrency in a sane range."""
+    """Keep batch size (ports per single Xray process) in a sane range."""
     try:
         concurrency = int(value)
     except (TypeError, ValueError):
@@ -194,23 +198,66 @@ async def ping_v2ray(
     test_bytes: int = DEFAULT_TEST_BYTES,
     xray_bin: str | None = None,
 ) -> V2RayPingResult:
-    outbound = link_to_xray_outbound(server)
-    if outbound is None:
-        return V2RayPingResult(
-            server=server,
-            latency=None,
-            error=f"unsupported scheme for Xray test: {server.scheme}",
-        )
+    """Probe one server (implemented as a single-entry batch)."""
+    results = await ping_v2ray_batch(
+        [server],
+        base_port=socks_port,
+        timeout=timeout,
+        test_url=test_url,
+        test_bytes=test_bytes,
+        xray_bin=xray_bin,
+    )
+    return results[0]
+
+
+async def ping_v2ray_batch(
+    servers: list[V2RayServer],
+    *,
+    base_port: int,
+    timeout: float = DEFAULT_TEST_TIMEOUT,
+    test_url: str = DEFAULT_TEST_URL,
+    test_bytes: int = DEFAULT_TEST_BYTES,
+    xray_bin: str | None = None,
+) -> list[V2RayPingResult]:
+    """Probe a batch of servers through one Xray process (one SOCKS port each)."""
+    if not servers:
+        return []
 
     bin_path = resolve_xray_bin(xray_bin)
     if not bin_path:
-        return V2RayPingResult(
-            server=server,
-            latency=None,
-            error="xray binary not found (set xray.bin in config.yaml, install xray on PATH, or run setup to install it in xray/)",
+        err = (
+            "xray binary not found (set xray.bin in config.yaml, install xray on PATH, "
+            "or run setup to install it in xray/)"
         )
+        return [
+            V2RayPingResult(server=server, latency=None, error=err)
+            for server in servers
+        ]
 
-    config = build_xray_config(outbound, socks_port)
+    prepared: list[tuple[int, V2RayServer, dict]] = []
+    early: list[V2RayPingResult | None] = [None] * len(servers)
+    for index, server in enumerate(servers):
+        outbound = link_to_xray_outbound(server)
+        if outbound is None:
+            early[index] = V2RayPingResult(
+                server=server,
+                latency=None,
+                error=f"unsupported scheme for Xray test: {server.scheme}",
+            )
+            continue
+        prepared.append((index, server, outbound))
+
+    if not prepared:
+        return [result for result in early if result is not None]
+
+    outbounds = [outbound for _index, _server, outbound in prepared]
+    # Compact ports 0..len(prepared)-1 so unused scheme failures don't leave holes.
+    config = build_xray_ping_batch_config(outbounds, base_port=base_port)
+    port_by_index = {
+        index: int(base_port) + prep_i
+        for prep_i, (index, _server, _outbound) in enumerate(prepared)
+    }
+
     cfg_path = None
     proc = None
     try:
@@ -219,7 +266,7 @@ async def ping_v2ray(
             encoding="utf-8",
             suffix=".json",
             delete=False,
-            prefix="xray-",
+            prefix="xray-ping-",
         ) as handle:
             handle.write(dumps_config(config))
             cfg_path = handle.name
@@ -234,17 +281,40 @@ async def ping_v2ray(
             stderr=asyncio.subprocess.DEVNULL,
             **hide_console_kwargs(),
         )
-        await _wait_port("127.0.0.1", socks_port, timeout=min(8.0, timeout))
-        latency, nbytes = await _ping_via_socks(
-            socks_port=socks_port,
-            url=test_url,
-            timeout=timeout,
-            max_bytes=test_bytes,
+
+        wait_timeout = min(8.0, timeout)
+        await asyncio.gather(
+            *(
+                _wait_port("127.0.0.1", port, wait_timeout)
+                for port in port_by_index.values()
+            )
         )
-        return V2RayPingResult(server=server, latency=latency, bytes_read=nbytes)
+
+        async def _one(index: int, server: V2RayServer) -> V2RayPingResult:
+            try:
+                latency, nbytes = await _ping_via_socks(
+                    socks_port=port_by_index[index],
+                    url=test_url,
+                    timeout=timeout,
+                    max_bytes=test_bytes,
+                )
+                return V2RayPingResult(server=server, latency=latency, bytes_read=nbytes)
+            except Exception as exc:
+                detail = str(exc) or type(exc).__name__
+                return V2RayPingResult(server=server, latency=None, error=detail)
+
+        probed = await asyncio.gather(
+            *(_one(index, server) for index, server, _outbound in prepared)
+        )
+        for (index, _server, _outbound), result in zip(prepared, probed):
+            early[index] = result
     except Exception as exc:
         detail = str(exc) or type(exc).__name__
-        return V2RayPingResult(server=server, latency=None, error=detail)
+        for index, server, _outbound in prepared:
+            if early[index] is None:
+                early[index] = V2RayPingResult(
+                    server=server, latency=None, error=detail
+                )
     finally:
         await _kill_xray_proc(proc)
         if cfg_path:
@@ -252,6 +322,30 @@ async def ping_v2ray(
                 os.unlink(cfg_path)
             except OSError:
                 pass
+
+    return [result for result in early if result is not None]
+
+
+def _select_batch(
+    servers: list[V2RayServer],
+    *,
+    start: int,
+    batch_size: int,
+    max_working: int | None,
+    working_keys: set[str],
+) -> tuple[list[V2RayServer], int]:
+    """Pick the next batch; after max_working, only re-check already-working keys."""
+    batch: list[V2RayServer] = []
+    index = start
+    total = len(servers)
+    while index < total and len(batch) < batch_size:
+        if max_working is not None and len(working_keys) >= max_working:
+            if servers[index].key not in working_keys:
+                index += 1
+                continue
+        batch.append(servers[index])
+        index += 1
+    return batch, index
 
 
 async def ping_v2ray_servers(
@@ -268,63 +362,51 @@ async def ping_v2ray_servers(
     initial_working_keys: set[str] | None = None,
     cancel_event: asyncio.Event | None = None,
 ) -> list[V2RayPingResult]:
+    """Probe servers in batches; each batch shares one Xray process and port window."""
     if not servers:
         return []
 
-    workers = clamp_ping_concurrency(concurrency)
+    batch_size = clamp_ping_concurrency(concurrency)
     results: list[V2RayPingResult] = []
-    lock = asyncio.Lock()
     working_keys: set[str] = set(initial_working_keys or ())
     done = 0
     next_index = 0
     total = len(servers)
 
-    async def _worker(worker_id: int) -> None:
-        nonlocal done, next_index
-        socks_port = int(base_port) + worker_id
-        while True:
-            async with lock:
-                if cancel_event and cancel_event.is_set():
-                    return
-                while True:
-                    if next_index >= total:
-                        return
-                    if (
-                        max_working is not None
-                        and len(working_keys) >= max_working
-                    ):
-                        while (
-                            next_index < total
-                            and servers[next_index].key not in working_keys
-                        ):
-                            next_index += 1
-                        if next_index >= total:
-                            return
-                    server = servers[next_index]
-                    next_index += 1
-                    break
+    while next_index < total:
+        if cancel_event and cancel_event.is_set():
+            break
 
-            result = await ping_v2ray(
-                server,
-                socks_port=socks_port,
-                timeout=timeout,
-                test_url=test_url,
-                test_bytes=test_bytes,
-                xray_bin=xray_bin,
-            )
-            async with lock:
-                done += 1
-                if result.ok and result.latency is not None:
-                    working_keys.add(server.key)
-                else:
-                    working_keys.discard(server.key)
-                results.append(result)
-                if on_result:
-                    on_result(done, total, result)
+        batch, next_index = _select_batch(
+            servers,
+            start=next_index,
+            batch_size=batch_size,
+            max_working=max_working,
+            working_keys=working_keys,
+        )
+        if not batch:
+            break
 
-    await asyncio.gather(
-        *(_worker(worker_id) for worker_id in range(min(workers, total)))
-    )
+        batch_results = await ping_v2ray_batch(
+            batch,
+            base_port=base_port,
+            timeout=timeout,
+            test_url=test_url,
+            test_bytes=test_bytes,
+            xray_bin=xray_bin,
+        )
+        for result in batch_results:
+            done += 1
+            if result.ok and result.latency is not None:
+                working_keys.add(result.server.key)
+            else:
+                working_keys.discard(result.server.key)
+            results.append(result)
+            if on_result:
+                on_result(done, total, result)
+        if cancel_event and cancel_event.is_set():
+            break
+
     return results
 
 

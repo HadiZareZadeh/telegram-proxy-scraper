@@ -51,8 +51,9 @@ v2ray:
   test_url: http://www.gstatic.com/generate_204
   test_bytes: 0
   test_timeout: 8.0
+  # Servers per batch / local SOCKS ports used by one shared Ping Xray process
   ping_concurrency: 20
-  # Local SOCKS ports for Ping V2Ray workers: base .. base+concurrency-1
+  # Local SOCKS ports for each Ping V2Ray batch: base .. base+concurrency-1
   # Kept far from proxy_pool.start_port so leftovers can be killed by range.
   ping_base_port: 45001
   # Stop probing once this many working servers are found (0 = unlimited)
@@ -94,7 +95,8 @@ probe:
   prune_incompatible_v2ray: true  # delete xhttp / splithttp / raw (Nekoray-incompatible)
 
 proxy_pool:
-  # Local SOCKS5+HTTP slots for emulators / other tools (Proxy pool tab)
+  # Local SOCKS5+HTTP slots for emulators / other tools (Proxy pool tab).
+  # All slots share one Xray process; validation uses a second process on 44001+.
   start_port: 10801
   count: 10
   # Rotate upstream V2Ray servers for every slot

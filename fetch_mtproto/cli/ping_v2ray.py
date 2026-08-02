@@ -131,12 +131,12 @@ def main() -> None:
         if winerror == 10055 or getattr(exc, "errno", None) in {55, 1055}:
             print(
                 "\nWindows ran out of network sockets (WinError 10055).\n"
-                "Usually caused by too many Xray processes or a prior ping/pool run.\n"
+                "Usually caused by socket exhaustion or a prior ping/pool run.\n"
                 "Try:\n"
                 "  1. Stop the proxy pool in the GUI\n"
                 "  2. Restart the control panel (clears leftover xray on ping/pool ports)\n"
                 "  3. Wait ~1–2 minutes for ports to free (TIME_WAIT)\n"
-                "  4. Lower v2ray.ping_concurrency in config.yaml (e.g. 6–8)\n"
+                "  4. Lower v2ray.ping_concurrency (batch size) in config.yaml (e.g. 6–8)\n"
                 "  5. Run Ping V2Ray again\n",
                 file=sys.stderr,
             )

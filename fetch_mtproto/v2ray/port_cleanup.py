@@ -9,18 +9,21 @@ from typing import Iterable
 
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_pid_tree
 
-# Proxy pool keeps 10801+ (Memu / emulators). Ping uses a separate high range.
+# Proxy pool keeps 10801+ (Memu / emulators). Ping / pool-test use separate ranges.
 DEFAULT_PING_BASE_PORT = 45001
 DEFAULT_POOL_START_PORT = 10801
 DEFAULT_POOL_COUNT = 10
+DEFAULT_POOL_TEST_BASE_PORT = 44001
 PORTS_PER_POOL_SLOT = 2
+# Single Stats API for the shared pool Xray process.
 POOL_API_PORT_OFFSET = 10000
+PORTS_PER_POOL_TEST = 2
 
 _XRAY_NAMES = frozenset({"xray", "xray.exe"})
 
 
 def ping_ports(base_port: int, concurrency: int) -> list[int]:
-    """One local SOCKS port per concurrent Ping V2Ray worker."""
+    """Local SOCKS ports used by one Ping V2Ray batch (single Xray process)."""
     base = max(1024, int(base_port))
     count = max(1, int(concurrency))
     last = base + count - 1
@@ -32,20 +35,36 @@ def ping_ports(base_port: int, concurrency: int) -> list[int]:
     return list(range(base, base + count))
 
 
+def pool_test_ports(base_port: int = DEFAULT_POOL_TEST_BASE_PORT) -> list[int]:
+    """SOCKS + HTTP ports for the proxy-pool validation Xray process."""
+    base = max(1024, int(base_port))
+    last = base + PORTS_PER_POOL_TEST - 1
+    if last > 65535:
+        raise ValueError(f"Proxy pool test ports exceed 65535 (base={base})")
+    return list(range(base, base + PORTS_PER_POOL_TEST))
+
+
 def pool_ports(start_port: int, count: int) -> list[int]:
-    """SOCKS + HTTP + stats API ports used by the proxy pool."""
+    """SOCKS + HTTP per slot + one shared stats API + pool-test ports."""
     start = max(1024, int(start_port))
     slots = max(1, int(count))
     ports: list[int] = []
     for index in range(slots):
         socks = start + index * PORTS_PER_POOL_SLOT
         http = socks + 1
-        api = socks + POOL_API_PORT_OFFSET
-        if http > 65535 or api > 65535:
+        if http > 65535:
             raise ValueError(
                 f"Proxy pool ports exceed 65535 (start={start}, count={slots})"
             )
-        ports.extend((socks, http, api))
+        ports.extend((socks, http))
+    api = start + POOL_API_PORT_OFFSET
+    if api > 65535:
+        raise ValueError(
+            f"Proxy pool API port exceeds 65535 "
+            f"(start={start}, offset={POOL_API_PORT_OFFSET})"
+        )
+    ports.append(api)
+    ports.extend(pool_test_ports())
     return ports
 
 
@@ -195,7 +214,7 @@ def cleanup_owned_xray_from_config(config) -> dict[str, list[int]]:
         getattr(config, "V2RAY_PING_BASE_PORT", DEFAULT_PING_BASE_PORT)
         or DEFAULT_PING_BASE_PORT
     )
-    concurrency = 64  # full allowed ping worker window
+    concurrency = 64  # full allowed ping batch window
 
     pool_start = int(
         getattr(config, "PROXY_POOL_START_PORT", DEFAULT_POOL_START_PORT)

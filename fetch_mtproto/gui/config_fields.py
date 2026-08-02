@@ -117,11 +117,12 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
             ConfigField(
                 "v2ray",
                 "ping_concurrency",
-                "Ping concurrency",
+                "Ping batch size",
                 "int",
                 20,
                 minimum=1,
-                maximum=100,
+                maximum=64,
+                hint="Servers (and local SOCKS ports) per shared Ping Xray process.",
             ),
             ConfigField(
                 "v2ray",
@@ -131,6 +132,7 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
                 45001,
                 minimum=1024,
                 maximum=65000,
+                hint="First SOCKS port of the Ping batch window.",
             ),
             ConfigField(
                 "v2ray",

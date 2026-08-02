@@ -284,8 +284,9 @@ class App:
         ttk.Label(
             parent,
             text=(
-                "Run local SOCKS5 + HTTP proxy pairs (one upstream V2Ray server per slot). "
-                "Each slot uses two ports: SOCKS5 then HTTP. "
+                "Run local SOCKS5 + HTTP proxy pairs (one upstream V2Ray server per slot) "
+                "from a single Xray process. Candidates are validated on a second Xray "
+                "process before ports 10801+ are updated. "
                 "Configure ports, rotation, and latency limits in Settings → Proxy pool."
             ),
             wraplength=720,

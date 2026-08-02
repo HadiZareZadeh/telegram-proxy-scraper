@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -306,74 +307,102 @@ def link_to_xray_outbound(server: V2RayServer) -> dict[str, Any] | None:
     return None
 
 
-def build_xray_config(outbound: dict[str, Any], socks_port: int) -> dict[str, Any]:
-    outbound = dict(outbound)
-    outbound.setdefault("tag", "proxy")
-    return {
-        "log": {"loglevel": "error"},
-        "inbounds": [
-            {
-                "tag": "socks-in",
-                "listen": "127.0.0.1",
-                "port": socks_port,
-                "protocol": "socks",
-                "settings": {"udp": False, "auth": "noauth"},
-            }
-        ],
-        "outbounds": [
-            outbound,
-            {"protocol": "freedom", "tag": "direct"},
-            {"protocol": "blackhole", "tag": "block"},
-        ],
-    }
+@dataclass(frozen=True, slots=True)
+class XrayRouteEntry:
+    """One upstream outbound exposed on optional local SOCKS and/or HTTP ports."""
+
+    outbound: dict[str, Any]
+    tag: str
+    socks_port: int | None = None
+    http_port: int | None = None
 
 
-def build_xray_pool_config(
-    outbound: dict[str, Any],
-    socks_port: int,
-    http_port: int,
+def build_xray_routed_config(
+    entries: list[XrayRouteEntry],
     *,
     api_port: int | None = None,
 ) -> dict[str, Any]:
-    """Xray config with local SOCKS5 + HTTP inbounds sharing one upstream.
+    """Single Xray config: N local inbounds routed to N tagged outbounds.
 
-    When api_port is set, enables StatsService so traffic can be queried
-    (NekoRay-style ↑/↓ counters).
+    Each entry may expose SOCKS5 and/or HTTP. Traffic from those inbounds is
+    forced to that entry's outbound via routing rules.
     """
-    outbound = dict(outbound)
-    outbound.setdefault("tag", "proxy")
-    inbounds: list[dict[str, Any]] = [
-        {
-            "tag": "socks-in",
-            "listen": "127.0.0.1",
-            "port": socks_port,
-            "protocol": "socks",
-            "settings": {"udp": False, "auth": "noauth"},
-        },
-        {
-            "tag": "http-in",
-            "listen": "127.0.0.1",
-            "port": http_port,
-            "protocol": "http",
-            "settings": {},
-        },
-    ]
+    if not entries:
+        raise ValueError("build_xray_routed_config requires at least one entry")
+
+    inbounds: list[dict[str, Any]] = []
+    outbounds: list[dict[str, Any]] = []
+    rules: list[dict[str, Any]] = []
+    seen_tags: set[str] = set()
+
+    for entry in entries:
+        tag = entry.tag.strip()
+        if not tag:
+            raise ValueError("outbound tag must be non-empty")
+        if tag in seen_tags:
+            raise ValueError(f"duplicate outbound tag: {tag}")
+        seen_tags.add(tag)
+
+        outbound = dict(entry.outbound)
+        outbound["tag"] = tag
+        outbounds.append(outbound)
+
+        inbound_tags: list[str] = []
+        if entry.socks_port is not None:
+            in_tag = f"socks-{tag}"
+            inbounds.append(
+                {
+                    "tag": in_tag,
+                    "listen": "127.0.0.1",
+                    "port": int(entry.socks_port),
+                    "protocol": "socks",
+                    "settings": {"udp": False, "auth": "noauth"},
+                }
+            )
+            inbound_tags.append(in_tag)
+        if entry.http_port is not None:
+            in_tag = f"http-{tag}"
+            inbounds.append(
+                {
+                    "tag": in_tag,
+                    "listen": "127.0.0.1",
+                    "port": int(entry.http_port),
+                    "protocol": "http",
+                    "settings": {},
+                }
+            )
+            inbound_tags.append(in_tag)
+        if not inbound_tags:
+            raise ValueError(f"entry {tag!r} needs socks_port and/or http_port")
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": inbound_tags,
+                "outboundTag": tag,
+            }
+        )
+
+    outbounds.extend(
+        [
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "block"},
+        ]
+    )
+
     config: dict[str, Any] = {
         "log": {"loglevel": "error"},
         "inbounds": inbounds,
-        "outbounds": [
-            outbound,
-            {"protocol": "freedom", "tag": "direct"},
-            {"protocol": "blackhole", "tag": "block"},
-        ],
+        "outbounds": outbounds,
+        "routing": {"domainStrategy": "AsIs", "rules": rules},
     }
+
     if api_port is not None:
         inbounds.insert(
             0,
             {
                 "tag": "api",
                 "listen": "127.0.0.1",
-                "port": api_port,
+                "port": int(api_port),
                 "protocol": "dokodemo-door",
                 "settings": {"address": "127.0.0.1"},
             },
@@ -391,16 +420,89 @@ def build_xray_pool_config(
                 "statsInboundDownlink": True,
             }
         }
-        config["routing"] = {
-            "rules": [
-                {
-                    "type": "field",
-                    "inboundTag": ["api"],
-                    "outboundTag": "api",
-                }
-            ]
-        }
+        rules.insert(
+            0,
+            {
+                "type": "field",
+                "inboundTag": ["api"],
+                "outboundTag": "api",
+            },
+        )
     return config
+
+
+def build_xray_config(outbound: dict[str, Any], socks_port: int) -> dict[str, Any]:
+    """Single SOCKS inbound → one upstream (legacy helper)."""
+    return build_xray_routed_config(
+        [XrayRouteEntry(outbound=outbound, tag="proxy", socks_port=socks_port)]
+    )
+
+
+def build_xray_pool_config(
+    outbound: dict[str, Any],
+    socks_port: int,
+    http_port: int,
+    *,
+    api_port: int | None = None,
+) -> dict[str, Any]:
+    """SOCKS5 + HTTP inbounds sharing one upstream (legacy single-slot helper)."""
+    return build_xray_routed_config(
+        [
+            XrayRouteEntry(
+                outbound=outbound,
+                tag="proxy",
+                socks_port=socks_port,
+                http_port=http_port,
+            )
+        ],
+        api_port=api_port,
+    )
+
+
+def build_xray_ping_batch_config(
+    outbounds: list[dict[str, Any]],
+    *,
+    base_port: int,
+) -> dict[str, Any]:
+    """One SOCKS inbound per outbound for batched Ping V2Ray probes."""
+    entries = [
+        XrayRouteEntry(
+            outbound=outbound,
+            tag=f"proxy-{index}",
+            socks_port=int(base_port) + index,
+        )
+        for index, outbound in enumerate(outbounds)
+    ]
+    return build_xray_routed_config(entries)
+
+
+def build_xray_multi_pool_config(
+    slot_outbounds: list[dict[str, Any] | None],
+    *,
+    start_port: int,
+    api_port: int | None = None,
+) -> dict[str, Any]:
+    """All proxy-pool slots in one process (SOCKS+HTTP per assigned upstream)."""
+    entries: list[XrayRouteEntry] = []
+    for index, outbound in enumerate(slot_outbounds):
+        if outbound is None:
+            continue
+        socks_port = int(start_port) + index * 2
+        entries.append(
+            XrayRouteEntry(
+                outbound=outbound,
+                tag=f"proxy-{index}",
+                socks_port=socks_port,
+                http_port=socks_port + 1,
+            )
+        )
+    if not entries:
+        raise ValueError("multi pool config needs at least one assigned slot")
+    return build_xray_routed_config(entries, api_port=api_port)
+
+
+def pool_outbound_tag(slot_index: int) -> str:
+    return f"proxy-{int(slot_index)}"
 
 
 def dumps_config(config: dict[str, Any]) -> str:
