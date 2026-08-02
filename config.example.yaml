@@ -118,3 +118,4 @@ gui:
   proxy_open_top: 10
   # Vertical split: fraction of window for tabs (rest is log + input)
   main_pane_ratio: 0.65
+
