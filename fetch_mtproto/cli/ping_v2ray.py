@@ -79,7 +79,7 @@ async def run(config, best: list) -> None:
             f"timeout={kwargs['timeout']}s\n"
             f"Order: highest priority_score first "
             f"(backoff={'on' if probe_kw['respect_backoff'] else 'off'}"
-            f"{f', failed cap={probe_kw['failed_limit']}' if probe_kw.get('failed_limit') else ''})\n"
+            f"{', failed cap={}'.format(probe_kw['failed_limit']) if probe_kw.get('failed_limit') else ''})\n"
         )
         killed = cleanup_ping_xray(
             base_port=kwargs["base_port"],
