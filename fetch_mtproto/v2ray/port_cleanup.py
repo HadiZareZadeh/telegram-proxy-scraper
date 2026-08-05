@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+import socket
 import subprocess
 import sys
+import time
 from typing import Iterable
 
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_pid_tree
@@ -198,6 +200,37 @@ def kill_xray_on_ports(ports: Iterable[int]) -> list[int]:
         kill_pid_tree(pid, timeout=3.0)
         killed.append(pid)
     return killed
+
+
+def _port_is_listening(host: str, port: int, *, timeout: float = 0.15) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def wait_ping_ports_free(
+    *,
+    base_port: int,
+    concurrency: int,
+    timeout: float = 5.0,
+) -> None:
+    """Block until ping SOCKS ports are not held by a leftover Xray listener."""
+    ports = ping_ports(base_port, concurrency)
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    while time.monotonic() < deadline:
+        occupied = [port for port in ports if _port_is_listening("127.0.0.1", port)]
+        if not occupied:
+            return
+        kill_xray_on_ports(occupied)
+        time.sleep(0.1)
+    still = [port for port in ports if _port_is_listening("127.0.0.1", port)]
+    if still:
+        raise TimeoutError(
+            f"Ping ports {ports[0]}–{ports[-1]} still in use "
+            f"({len(still)} listener(s) remaining)"
+        )
 
 
 def cleanup_ping_xray(*, base_port: int, concurrency: int) -> list[int]:
