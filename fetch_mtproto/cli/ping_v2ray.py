@@ -12,6 +12,7 @@ from fetch_mtproto.prune import probe_kwargs_from_config
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
 from fetch_mtproto.v2ray.port_cleanup import cleanup_ping_xray
 from fetch_mtproto.v2ray.settings import v2ray_test_kwargs
+from fetch_mtproto.v2ray.store import XRAY_SCHEMES, V2RAY_SCHEMES
 
 
 def _print_fastest(fastest) -> None:
@@ -68,6 +69,7 @@ async def run(config, best: list) -> None:
             sys.exit(1)
 
         summary = db.v2ray_health_summary()
+        non_xray = sorted(set(V2RAY_SCHEMES) - set(XRAY_SCHEMES))
         print(
             f"Adaptive probe queue: {len(queue)}/{total_unique} "
             f"(working={working}, failed={failed}; "
@@ -80,6 +82,8 @@ async def run(config, best: list) -> None:
             f"Order: highest priority_score first "
             f"(backoff={'on' if probe_kw['respect_backoff'] else 'off'}"
             f"{', failed cap={}'.format(probe_kw['failed_limit']) if probe_kw.get('failed_limit') else ''})\n"
+            f"Xray-testable schemes only: {', '.join(sorted(XRAY_SCHEMES))} "
+            f"(skipped in catalog: {', '.join(non_xray)})\n"
         )
         killed = cleanup_ping_xray(
             base_port=kwargs["base_port"],
@@ -117,6 +121,9 @@ async def run(config, best: list) -> None:
 
 
 def main() -> None:
+    from fetch_mtproto.logging_setup import setup_logging
+
+    setup_logging()
     config = load_config()
     best: list = [None]
     try:

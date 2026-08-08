@@ -25,7 +25,7 @@ fetch-mtproto/
     ├── catalog.db           # single SQLite DB (MTProto + V2Ray)
     └── subscription.txt     # NekoRay export (working V2Ray only)
 sessions/                    # Telegram session files (auto-created)
-logs/                        # saved GUI logs (auto-created)
+logs/                        # error.log, debug.log, saved GUI logs (auto-created)
 xray/                        # Xray-core binary + geo data (when not on PATH)
 ```
 

@@ -37,6 +37,14 @@ DEFAULT_TEST_TIMEOUT = 8.0
 DEFAULT_PING_CONCURRENCY = 20
 
 
+class BatchStartupError(Exception):
+    """Raised when the shared batch Xray process fails before probes can run."""
+
+    def __init__(self, message: str, *, stderr: str = "") -> None:
+        super().__init__(message)
+        self.stderr = stderr
+
+
 @dataclass(slots=True)
 class V2RayPingResult:
     server: V2RayServer
@@ -135,6 +143,27 @@ async def _wait_batch_ports(
             return ready
         await asyncio.sleep(0.05)
     return ready
+
+
+async def _validate_xray_config(bin_path: str, cfg_path: str) -> str | None:
+    """Return an error string when Xray rejects the config, else None."""
+    proc = await asyncio.create_subprocess_exec(
+        bin_path,
+        "run",
+        "-test",
+        "-c",
+        cfg_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        **hide_console_kwargs(),
+    )
+    _stdout, stderr = await proc.communicate()
+    if proc.returncode == 0:
+        return None
+    detail = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
+    if detail:
+        return detail
+    return f"Xray config test failed (code {proc.returncode})"
 
 
 async def _release_ping_ports(
@@ -253,6 +282,149 @@ async def _ping_via_socks(
             pass
 
 
+async def _probe_prepared_batch(
+    *,
+    bin_path: str,
+    prepared: list[tuple[int, V2RayServer, dict]],
+    port_by_index: dict[int, int],
+    base_port: int,
+    timeout: float,
+    test_url: str,
+    test_bytes: int,
+) -> list[tuple[int, V2RayPingResult]]:
+    """Run one shared Xray process for a batch config."""
+    batch_size = len(prepared)
+    cfg_path = None
+    stderr_path = None
+    proc = None
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: wait_ping_ports_free(
+                base_port=base_port,
+                concurrency=batch_size,
+                timeout=5.0,
+            ),
+        )
+
+        config = build_xray_ping_batch_config(
+            [outbound for _index, _server, outbound in prepared],
+            base_port=base_port,
+        )
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".json",
+            delete=False,
+            prefix="xray-ping-",
+        ) as handle:
+            handle.write(dumps_config(config))
+            cfg_path = handle.name
+
+        config_err = await _validate_xray_config(bin_path, cfg_path)
+        if config_err:
+            raise BatchStartupError(
+                f"invalid Xray config: {config_err}",
+                stderr=config_err,
+            )
+
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=".log", prefix="xray-ping-err-"
+        ) as err_handle:
+            stderr_path = err_handle.name
+
+        with open(stderr_path, "wb") as stderr_file:
+            proc = await asyncio.create_subprocess_exec(
+                bin_path,
+                "run",
+                "-c",
+                cfg_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=stderr_file,
+                **hide_console_kwargs(),
+            )
+
+        wait_timeout = min(12.0, max(8.0, timeout))
+        ready_ports = await _wait_batch_ports(
+            proc,
+            list(port_by_index.values()),
+            timeout=wait_timeout,
+            stderr_path=stderr_path,
+        )
+
+        async def _one(index: int, server: V2RayServer) -> V2RayPingResult:
+            port = port_by_index[index]
+            if port not in ready_ports:
+                detail = f"Xray SOCKS port {port} did not open"
+                if not ready_ports:
+                    xray_err = _read_xray_stderr(stderr_path)
+                    if xray_err:
+                        detail = f"{detail} ({xray_err})"
+                return V2RayPingResult(server=server, latency=None, error=detail)
+            try:
+                latency, nbytes = await _ping_via_socks(
+                    socks_port=port,
+                    url=test_url,
+                    timeout=timeout,
+                    max_bytes=test_bytes,
+                )
+                return V2RayPingResult(server=server, latency=latency, bytes_read=nbytes)
+            except Exception as exc:
+                detail = str(exc) or type(exc).__name__
+                return V2RayPingResult(server=server, latency=None, error=detail)
+
+        probed = await asyncio.gather(
+            *(_one(index, server) for index, server, _outbound in prepared)
+        )
+        return list(zip((index for index, _server, _outbound in prepared), probed))
+    except RuntimeError as exc:
+        detail = str(exc) or type(exc).__name__
+        stderr = _read_xray_stderr(stderr_path)
+        raise BatchStartupError(detail, stderr=stderr) from exc
+    finally:
+        await _kill_xray_proc(proc)
+        if cfg_path:
+            try:
+                os.unlink(cfg_path)
+            except OSError:
+                pass
+        if stderr_path:
+            try:
+                os.unlink(stderr_path)
+            except OSError:
+                pass
+        try:
+            await _release_ping_ports(base_port=base_port, concurrency=batch_size)
+        except Exception:
+            pass
+
+
+async def _fallback_probe_servers(
+    servers: list[V2RayServer],
+    *,
+    base_port: int,
+    timeout: float,
+    test_url: str,
+    test_bytes: int,
+    xray_bin: str | None,
+) -> list[V2RayPingResult]:
+    """Probe servers one at a time when a shared batch config cannot start."""
+    results: list[V2RayPingResult] = []
+    for server in servers:
+        results.extend(
+            await ping_v2ray_batch(
+                [server],
+                base_port=base_port,
+                timeout=timeout,
+                test_url=test_url,
+                test_bytes=test_bytes,
+                xray_bin=xray_bin,
+            )
+        )
+    return results
+
+
 async def ping_v2ray(
     server: V2RayServer,
     *,
@@ -314,117 +486,48 @@ async def ping_v2ray_batch(
     if not prepared:
         return [result for result in early if result is not None]
 
-    outbounds = [outbound for _index, _server, outbound in prepared]
-    # Compact ports 0..len(prepared)-1 so unused scheme failures don't leave holes.
-    config = build_xray_ping_batch_config(outbounds, base_port=base_port)
     port_by_index = {
         index: int(base_port) + prep_i
         for prep_i, (index, _server, _outbound) in enumerate(prepared)
     }
-    batch_size = len(prepared)
 
-    cfg_path = None
-    stderr_path = None
-    proc = None
-    loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: wait_ping_ports_free(
-                base_port=base_port,
-                concurrency=batch_size,
-                timeout=5.0,
-            ),
+        probed = await _probe_prepared_batch(
+            bin_path=bin_path,
+            prepared=prepared,
+            port_by_index=port_by_index,
+            base_port=base_port,
+            timeout=timeout,
+            test_url=test_url,
+            test_bytes=test_bytes,
         )
-
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            suffix=".json",
-            delete=False,
-            prefix="xray-ping-",
-        ) as handle:
-            handle.write(dumps_config(config))
-            cfg_path = handle.name
-
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=".log", prefix="xray-ping-err-"
-        ) as err_handle:
-            stderr_path = err_handle.name
-
-        # Log to a file (not a pipe) so startup failures are visible without handle leaks.
-        with open(stderr_path, "wb") as stderr_file:
-            proc = await asyncio.create_subprocess_exec(
-                bin_path,
-                "run",
-                "-c",
-                cfg_path,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=stderr_file,
-                **hide_console_kwargs(),
-            )
-
-        wait_timeout = min(12.0, max(8.0, timeout))
-        ready_ports = await _wait_batch_ports(
-            proc,
-            list(port_by_index.values()),
-            timeout=wait_timeout,
-            stderr_path=stderr_path,
-        )
-
-        async def _one(index: int, server: V2RayServer) -> V2RayPingResult:
-            port = port_by_index[index]
-            if port not in ready_ports:
-                detail = f"Xray SOCKS port {port} did not open"
-                if not ready_ports:
-                    xray_err = _read_xray_stderr(stderr_path)
-                    if xray_err:
-                        detail = f"{detail} ({xray_err})"
-                return V2RayPingResult(server=server, latency=None, error=detail)
-            try:
-                latency, nbytes = await _ping_via_socks(
-                    socks_port=port,
-                    url=test_url,
-                    timeout=timeout,
-                    max_bytes=test_bytes,
-                )
-                return V2RayPingResult(server=server, latency=latency, bytes_read=nbytes)
-            except Exception as exc:
-                detail = str(exc) or type(exc).__name__
-                return V2RayPingResult(server=server, latency=None, error=detail)
-
-        probed = await asyncio.gather(
-            *(_one(index, server) for index, server, _outbound in prepared)
-        )
-        for (index, _server, _outbound), result in zip(prepared, probed):
+        for index, result in probed:
             early[index] = result
-    except Exception as exc:
-        detail = str(exc) or type(exc).__name__
-        if not detail.startswith("Xray") and stderr_path:
-            xray_err = _read_xray_stderr(stderr_path)
-            if xray_err:
-                detail = f"{detail} ({xray_err})"
-        for index, server, _outbound in prepared:
-            if early[index] is None:
-                early[index] = V2RayPingResult(
-                    server=server, latency=None, error=detail
+    except BatchStartupError as exc:
+        fallback_servers = [server for _index, server, _outbound in prepared]
+        if len(fallback_servers) > 1:
+            fallback_results = await _fallback_probe_servers(
+                fallback_servers,
+                base_port=base_port,
+                timeout=timeout,
+                test_url=test_url,
+                test_bytes=test_bytes,
+                xray_bin=xray_bin,
+            )
+            by_key = {result.server.key: result for result in fallback_results}
+            for index, server, _outbound in prepared:
+                early[index] = by_key.get(
+                    server.key,
+                    V2RayPingResult(server=server, latency=None, error=str(exc)),
                 )
-    finally:
-        await _kill_xray_proc(proc)
-        if cfg_path:
-            try:
-                os.unlink(cfg_path)
-            except OSError:
-                pass
-        if stderr_path:
-            try:
-                os.unlink(stderr_path)
-            except OSError:
-                pass
-        try:
-            await _release_ping_ports(base_port=base_port, concurrency=batch_size)
-        except Exception:
-            pass
+        else:
+            detail = str(exc) or type(exc).__name__
+            if exc.stderr and exc.stderr not in detail:
+                detail = f"{detail} ({exc.stderr})"
+            index, server, _outbound = prepared[0]
+            early[index] = V2RayPingResult(
+                server=server, latency=None, error=detail
+            )
 
     return [result for result in early if result is not None]
 

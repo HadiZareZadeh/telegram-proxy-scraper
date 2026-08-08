@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from fetch_mtproto.v2ray.store import V2RayServer, _b64decode, _safe_json
-
-
-XRAY_SCHEMES = frozenset({"vmess", "vless", "trojan", "ss"})
+from fetch_mtproto.v2ray.store import (
+    XRAY_SCHEMES,
+    V2RayServer,
+    _b64decode,
+    _safe_json,
+)
 
 
 def _q(qs: dict[str, list[str]], name: str, default: str = "") -> str:

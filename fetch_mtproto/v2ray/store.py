@@ -29,6 +29,10 @@ V2RAY_SCHEMES = (
     "wireguard",
 )
 
+# Schemes the bundled Xray binary can actually probe (Ping V2Ray / proxy pool).
+# Other V2RAY_SCHEMES stay in the catalog for NekoRay subscription export only.
+XRAY_SCHEMES = frozenset({"vmess", "vless", "trojan", "ss"})
+
 _SCHEME_ALT = "|".join(V2RAY_SCHEMES)
 _V2RAY_URL_RE = re.compile(
     rf"(?P<link>(?:{_SCHEME_ALT})://[^\s<>\"'`]+)",
@@ -451,7 +455,8 @@ class V2RayCatalog:
                 limit=limit,
                 failed_limit=failed_limit,
             )
-            if is_nekoray_compatible(server := _server_from_row(row))
+            if (server := _server_from_row(row)).scheme in XRAY_SCHEMES
+            and is_nekoray_compatible(server)
         ]
 
     def prune_stale(self) -> dict[str, int]:
@@ -501,6 +506,10 @@ class V2RayCatalog:
             server = result.server
             if server.scheme not in self.working:
                 continue
+            # Never record "can't test with Xray" as a real probe failure.
+            err = getattr(result, "error", None) or ""
+            if not result.ok and "unsupported scheme" in err.lower():
+                continue
             identity = server.as_db_row()
             if result.ok and result.latency is not None:
                 outcomes.append((server.key, True, result.latency, None, identity))
@@ -511,7 +520,7 @@ class V2RayCatalog:
                         server.key,
                         False,
                         None,
-                        getattr(result, "error", None),
+                        err or None,
                         identity,
                     )
                 )

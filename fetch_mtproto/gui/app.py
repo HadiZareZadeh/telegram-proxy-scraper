@@ -1295,6 +1295,9 @@ class App:
 
 
 def main() -> None:
+    from fetch_mtproto.logging_setup import setup_logging
+
+    setup_logging()
     App().run()
 
 

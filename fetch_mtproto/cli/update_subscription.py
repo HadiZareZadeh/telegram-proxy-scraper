@@ -15,6 +15,9 @@ from fetch_mtproto.subscription_server import (
 
 
 def main() -> None:
+    from fetch_mtproto.logging_setup import setup_logging
+
+    setup_logging()
     config = load_config(required=False)
     default_host, default_port = resolve_server_settings(config)
 

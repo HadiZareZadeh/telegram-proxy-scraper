@@ -94,6 +94,9 @@ async def run(config, best: list) -> None:
 
 
 def main() -> None:
+    from fetch_mtproto.logging_setup import setup_logging
+
+    setup_logging()
     patch_telethon_faketls()
     config = load_config()
     best: list = [None]
