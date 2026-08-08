@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import socket
 import subprocess
@@ -200,6 +201,30 @@ def kill_xray_on_ports(ports: Iterable[int]) -> list[int]:
         kill_pid_tree(pid, timeout=3.0)
         killed.append(pid)
     return killed
+
+
+def kill_listeners_on_ports(ports: Iterable[int]) -> list[int]:
+    """
+    Kill any process listening on the given ports (not limited to Xray).
+    Skips this process. Returns the list of PIDs that were targeted.
+    """
+    self_pid = os.getpid()
+    by_pid = listening_pids_on_ports(ports)
+    killed: list[int] = []
+    for pid in sorted(by_pid):
+        if pid == self_pid:
+            continue
+        kill_pid_tree(pid, timeout=3.0)
+        killed.append(pid)
+    return killed
+
+
+def cleanup_subscription_port(port: int) -> list[int]:
+    """Free the subscription HTTP bind port if a leftover process holds it."""
+    port = int(port)
+    if port <= 0 or port > 65535:
+        return []
+    return kill_listeners_on_ports([port])
 
 
 def _port_is_listening(host: str, port: int, *, timeout: float = 0.15) -> bool:

@@ -23,6 +23,12 @@ TELEGRAM_EXE = os.path.join(
     os.environ.get("APPDATA", ""), "Telegram Desktop", "Telegram.exe"
 )
 
+# Supervisor: long-running systems re-run forever after unexpected exit.
+DEFAULT_RESTART_BACKOFF_SEC = 2.0
+DEFAULT_RESTART_BACKOFF_MAX_SEC = 30.0
+# After this much continuous uptime, the next failure starts backoff from the base again.
+RESTART_STABLE_UPTIME_SEC = 60.0
+
 
 @dataclass
 class Job:
@@ -34,10 +40,20 @@ class Job:
     stoppable: bool = False
     process: subprocess.Popen | None = field(default=None, repr=False)
     cancel_file: Path | None = field(default=None, repr=False)
+    # Supervisor state: keep the job up until the user explicitly stops it.
+    want_running: bool = False
+    restart_attempt: int = 0
+    restart_after_id: str | None = field(default=None, repr=False)
+    started_at: float | None = field(default=None, repr=False)
 
     @property
     def running(self) -> bool:
         return self.process is not None and self.process.poll() is None
+
+    @property
+    def supervised(self) -> bool:
+        """True while the user wants this long-running job kept alive."""
+        return self.long_running and self.want_running
 
 
 class App:
@@ -82,6 +98,10 @@ class App:
         self._config_save_after_id: str | None = None
         self._loading_config = False
         self._proxy_pool_testing = False
+        self._proxy_pool_want_running = False
+        self._proxy_pool_restart_attempt = 0
+        self._proxy_pool_restart_after_id: str | None = None
+        self._proxy_pool_started_at: float | None = None
 
         self.settings = ConfigSettingsPanel(self)
         self._build_ui()
@@ -652,7 +672,7 @@ class App:
     def toggle_job(self, key: str) -> None:
         spec = self.JOBS[key]
         job = self.jobs.get(key)
-        if job is not None and job.running:
+        if job is not None and (job.running or job.supervised):
             if spec["long_running"] or spec.get("stoppable"):
                 self.stop_job(key)
             else:
@@ -660,8 +680,153 @@ class App:
             return
         self.start_job(key)
 
-    def start_job(self, key: str) -> None:
+    def _restart_backoff_settings(self) -> tuple[float, float]:
+        from fetch_mtproto.config_loader import config_float, load_config
+
+        config = load_config(required=False)
+        base = DEFAULT_RESTART_BACKOFF_SEC
+        max_sec = DEFAULT_RESTART_BACKOFF_MAX_SEC
+        if config is not None:
+            base = config_float(
+                getattr(config, "GUI_RESTART_BACKOFF_SEC", None),
+                DEFAULT_RESTART_BACKOFF_SEC,
+            )
+            max_sec = config_float(
+                getattr(config, "GUI_RESTART_BACKOFF_MAX_SEC", None),
+                DEFAULT_RESTART_BACKOFF_MAX_SEC,
+            )
+        base = max(0.5, float(base))
+        max_sec = max(base, float(max_sec))
+        return base, max_sec
+
+    def _cancel_job_restart(self, key: str) -> None:
+        job = self.jobs.get(key)
+        if job is None or job.restart_after_id is None:
+            return
+        try:
+            self.root.after_cancel(job.restart_after_id)
+        except tk.TclError:
+            pass
+        job.restart_after_id = None
+
+    def _cleanup_before_job(self, key: str) -> None:
+        """Free leftover processes/ports this job needs before (re)starting."""
+        label = self.JOBS[key]["label"]
+        job = self.jobs.get(key)
+        if job is not None and job.process is not None and job.process.poll() is None:
+            self.log_line(f"[{label}] cleaning up previous process tree…")
+            kill_process_tree(job.process)
+
+        if key == "serve":
+            from fetch_mtproto.config_loader import load_config
+            from fetch_mtproto.subscription_server import resolve_server_settings
+            from fetch_mtproto.v2ray.port_cleanup import cleanup_subscription_port
+
+            config = load_config(required=False)
+            _host, port = resolve_server_settings(config)
+            try:
+                killed = cleanup_subscription_port(port)
+            except Exception as exc:
+                self.log_line(f"[{label}] port cleanup failed: {exc}")
+                return
+            if killed:
+                self.log_line(
+                    f"[{label}] cleared {len(killed)} listener(s) on port {port}"
+                )
+            return
+
+        if key in {"scrape", "ping_v2ray"}:
+            from fetch_mtproto.config_loader import config_int, load_config
+            from fetch_mtproto.v2ray.port_cleanup import (
+                DEFAULT_PING_BASE_PORT,
+                cleanup_ping_xray,
+            )
+
+            config = load_config(required=False)
+            base = DEFAULT_PING_BASE_PORT
+            concurrency = 64
+            if config is not None:
+                base = config_int(
+                    getattr(config, "V2RAY_PING_BASE_PORT", None),
+                    DEFAULT_PING_BASE_PORT,
+                    minimum=1024,
+                    maximum=65535,
+                )
+                concurrency = config_int(
+                    getattr(config, "V2RAY_PING_CONCURRENCY", None),
+                    20,
+                    minimum=1,
+                    maximum=64,
+                )
+                # Clear the full allowed window in case concurrency was higher before.
+                concurrency = max(concurrency, 64)
+            try:
+                killed = cleanup_ping_xray(base_port=base, concurrency=concurrency)
+            except Exception as exc:
+                self.log_line(f"[{label}] xray port cleanup failed: {exc}")
+                return
+            if killed:
+                self.log_line(
+                    f"[{label}] cleared {len(killed)} leftover xray on ping ports"
+                )
+
+    def _schedule_job_restart(self, key: str) -> None:
         spec = self.JOBS[key]
+        job = self.jobs.get(key)
+        if job is None or not job.want_running or not spec["long_running"]:
+            return
+        self._cancel_job_restart(key)
+        if (
+            job.started_at is not None
+            and (time.monotonic() - job.started_at) >= RESTART_STABLE_UPTIME_SEC
+        ):
+            job.restart_attempt = 0
+        base, max_sec = self._restart_backoff_settings()
+        delay = min(max_sec, base * (2 ** job.restart_attempt))
+        job.restart_attempt += 1
+        self.log_line(
+            f"[{spec['label']}] will re-run in {delay:.0f}s "
+            f"(attempt {job.restart_attempt}, backoff)…"
+        )
+        job.restart_after_id = self.root.after(
+            int(delay * 1000),
+            lambda k=key: self._do_job_restart(k),
+        )
+
+    def _do_job_restart(self, key: str) -> None:
+        job = self.jobs.get(key)
+        if job is None:
+            return
+        job.restart_after_id = None
+        if not job.want_running or job.running:
+            return
+        self.start_job(key, is_restart=True)
+
+    def start_job(self, key: str, *, is_restart: bool = False) -> None:
+        spec = self.JOBS[key]
+        existing = self.jobs.get(key)
+        if existing is not None and existing.running:
+            self.log_line(f"[{spec['label']}] already running…")
+            return
+
+        if existing is not None:
+            existing.want_running = True
+            if not is_restart:
+                existing.restart_attempt = 0
+            self._cancel_job_restart(key)
+        elif spec["long_running"]:
+            # Placeholder so Stop works during a failed first start / backoff.
+            self.jobs[key] = Job(
+                name=key,
+                args=[],
+                long_running=True,
+                stoppable=bool(spec.get("stoppable")),
+                want_running=True,
+                restart_attempt=0 if not is_restart else 1,
+            )
+
+        self._cleanup_before_job(key)
+
         args = [sys.executable, "-u", "-m", spec["module"]]
         if key == "serve":
             from fetch_mtproto.catalogs import subscription_path
@@ -704,9 +869,22 @@ class App:
         try:
             process = subprocess.Popen(args, **popen_kw)
         except OSError as exc:
-            messagebox.showerror("fetch-mtproto", f"Failed to start: {exc}")
+            if not is_restart:
+                messagebox.showerror("fetch-mtproto", f"Failed to start: {exc}")
+            else:
+                self.log_line(f"[{spec['label']}] failed to start: {exc}")
+            job = self.jobs.get(key)
+            if job is not None and job.want_running and spec["long_running"]:
+                self.buttons[key].configure(text=self._job_button_stop_text(spec))
+                self._schedule_job_restart(key)
             return
 
+        prior = self.jobs.get(key)
+        want_running = True if spec["long_running"] else False
+        restart_attempt = 0
+        if prior is not None:
+            want_running = prior.want_running if spec["long_running"] else False
+            restart_attempt = prior.restart_attempt if is_restart else 0
         job = Job(
             name=key,
             args=args,
@@ -714,10 +892,14 @@ class App:
             stoppable=bool(spec.get("stoppable")),
             process=process,
             cancel_file=cancel_file,
+            want_running=want_running,
+            restart_attempt=restart_attempt,
+            started_at=time.monotonic(),
         )
         self.jobs[key] = job
         self.active_stdin = key
-        self.log_line(f"[{spec['label']}] started (pid {process.pid})")
+        verb = "re-started" if is_restart else "started"
+        self.log_line(f"[{spec['label']}] {verb} (pid {process.pid})")
         if spec["long_running"] or spec.get("stoppable"):
             self.buttons[key].configure(text=self._job_button_stop_text(spec))
 
@@ -757,21 +939,39 @@ class App:
                 job.cancel_file.unlink(missing_ok=True)
             except OSError:
                 pass
+        if key == "serve" and (job is None or not job.want_running):
+            self._hide_subscription_panel()
+        if self.active_stdin == key:
+            self.active_stdin = None
+
+        if job is not None and job.want_running and spec["long_running"]:
+            # Keep Stop button so the user can cancel the pending re-run.
+            self.buttons[key].configure(text=self._job_button_stop_text(spec))
+            self._schedule_job_restart(key)
+            self.refresh_status()
+            return
+
         if key == "serve":
             self._hide_subscription_panel()
         if spec["long_running"] or spec.get("stoppable"):
             self.buttons[key].configure(text=self._job_button_start_text(spec))
-        if self.active_stdin == key:
-            self.active_stdin = None
+        if job is not None:
+            job.want_running = False
         self.refresh_status()
 
     def stop_job(self, key: str) -> None:
         job = self.jobs.get(key)
-        if job is None or not job.running:
+        if job is None:
             return
         spec = self.JOBS[key]
+        job.want_running = False
+        self._cancel_job_restart(key)
         if key == "serve":
             self._hide_subscription_panel()
+        if not job.running:
+            self.buttons[key].configure(text=self._job_button_start_text(spec))
+            self.log_line(f"[{spec['label']}] restart cancelled")
+            return
         assert job.process is not None
         if spec.get("stoppable") and job.cancel_file is not None:
             self.log_line(f"[{spec['label']}] stopping (saving checked servers)…")
@@ -883,6 +1083,8 @@ class App:
     def toggle_proxy_pool(self) -> None:
         if self.proxy_pool is not None and self.proxy_pool.running:
             self.stop_proxy_pool()
+        elif self._proxy_pool_want_running:
+            self.stop_proxy_pool()
         else:
             self.start_proxy_pool()
 
@@ -928,7 +1130,7 @@ class App:
         except OSError as exc:
             self.log_line(f"[config] failed to save config.yaml: {exc}")
 
-    def start_proxy_pool(self) -> None:
+    def start_proxy_pool(self, *, is_restart: bool = False) -> None:
         from fetch_mtproto.config_loader import load_config
         from fetch_mtproto.v2ray.ping import resolve_xray_bin
 
@@ -953,16 +1155,28 @@ class App:
             )
             random_pick = bool(self.settings.var("proxy_pool", "random").get())
         except tk.TclError:
-            messagebox.showerror("fetch-mtproto", "Invalid proxy pool settings.")
+            if not is_restart:
+                messagebox.showerror("fetch-mtproto", "Invalid proxy pool settings.")
+            else:
+                self.log_line("[proxy pool] invalid settings — will retry")
+            self._proxy_pool_want_running = True
+            self.pool_btn.configure(text="Stop proxy pool")
+            self._schedule_proxy_pool_restart()
             return
 
         last_port = ProxyPoolRunner.last_port(start_port, count)
         if last_port > 65535:
-            messagebox.showerror(
-                "fetch-mtproto",
+            msg = (
                 f"Port range {start_port}–{last_port} exceeds 65535 "
-                f"(each slot uses SOCKS5 + HTTP on two consecutive ports).",
+                f"(each slot uses SOCKS5 + HTTP on two consecutive ports)."
             )
+            if not is_restart:
+                messagebox.showerror("fetch-mtproto", msg)
+            else:
+                self.log_line(f"[proxy pool] {msg}")
+            self._proxy_pool_want_running = True
+            self.pool_btn.configure(text="Stop proxy pool")
+            self._schedule_proxy_pool_restart()
             return
 
         self._save_ui_config()
@@ -970,11 +1184,20 @@ class App:
         config = load_config(required=False)
         xray_bin = resolve_xray_bin(getattr(config, "XRAY_BIN", None) if config else None)
         if not xray_bin:
-            messagebox.showerror(
-                "fetch-mtproto",
-                "Xray binary not found. Run setup or set xray.bin in config.yaml.",
-            )
+            msg = "Xray binary not found. Run setup or set xray.bin in config.yaml."
+            if not is_restart:
+                messagebox.showerror("fetch-mtproto", msg)
+            else:
+                self.log_line(f"[proxy pool] {msg}")
+            self._proxy_pool_want_running = True
+            self.pool_btn.configure(text="Stop proxy pool")
+            self._schedule_proxy_pool_restart()
             return
+
+        self._cancel_proxy_pool_restart()
+        self._proxy_pool_want_running = True
+        if not is_restart:
+            self._proxy_pool_restart_attempt = 0
 
         self.proxy_pool = ProxyPoolRunner(
             start_port=start_port,
@@ -990,15 +1213,18 @@ class App:
             on_finished=self._proxy_pool_finished,
         )
         self.proxy_pool.start()
+        self._proxy_pool_started_at = time.monotonic()
         self.pool_btn.configure(text="Stop proxy pool")
         self.settings.set_pool_inputs_enabled(False)
         mode = "random" if random_pick else "fastest-first"
+        verb = "re-starting" if is_restart else "starting"
         self.log_line(
-            f"[proxy pool] starting {count} slot(s): SOCKS5+HTTP on ports "
+            f"[proxy pool] {verb} {count} slot(s): SOCKS5+HTTP on ports "
             f"{start_port}–{last_port} (switch every {switch_sec}s, "
             f"{mode} ≤{max_latency_ms} ms)"
         )
-        self.notebook.select(self.proxy_pool_tab)
+        if not is_restart:
+            self.notebook.select(self.proxy_pool_tab)
 
     def test_proxy_pool(self) -> None:
         if self._proxy_pool_testing:
@@ -1076,7 +1302,16 @@ class App:
         self.root.after(0, finish)
 
     def stop_proxy_pool(self) -> None:
-        if self.proxy_pool is None:
+        self._proxy_pool_want_running = False
+        self._cancel_proxy_pool_restart()
+        if self.proxy_pool is None or not self.proxy_pool.running:
+            self.proxy_pool = None
+            self._proxy_pool_testing = False
+            self.pool_btn.configure(text="Start proxy pool", state="normal")
+            self.pool_test_btn.configure(state="normal")
+            self.settings.set_pool_inputs_enabled(True)
+            self._update_proxy_pool_status([])
+            self.log_line("[proxy pool] restart cancelled")
             return
         pool = self.proxy_pool
         self.log_line("[proxy pool] stopping…")
@@ -1129,10 +1364,56 @@ class App:
 
         self.root.after(0, apply)
 
+    def _cancel_proxy_pool_restart(self) -> None:
+        if self._proxy_pool_restart_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._proxy_pool_restart_after_id)
+        except tk.TclError:
+            pass
+        self._proxy_pool_restart_after_id = None
+
+    def _schedule_proxy_pool_restart(self) -> None:
+        if not self._proxy_pool_want_running:
+            return
+        self._cancel_proxy_pool_restart()
+        if (
+            self._proxy_pool_started_at is not None
+            and (time.monotonic() - self._proxy_pool_started_at)
+            >= RESTART_STABLE_UPTIME_SEC
+        ):
+            self._proxy_pool_restart_attempt = 0
+        base, max_sec = self._restart_backoff_settings()
+        delay = min(max_sec, base * (2 ** self._proxy_pool_restart_attempt))
+        self._proxy_pool_restart_attempt += 1
+        self.log_line(
+            f"[proxy pool] will re-run in {delay:.0f}s "
+            f"(attempt {self._proxy_pool_restart_attempt}, backoff)…"
+        )
+        self.pool_btn.configure(text="Stop proxy pool", state="normal")
+        self._proxy_pool_restart_after_id = self.root.after(
+            int(delay * 1000),
+            self._do_proxy_pool_restart,
+        )
+
+    def _do_proxy_pool_restart(self) -> None:
+        self._proxy_pool_restart_after_id = None
+        if not self._proxy_pool_want_running:
+            return
+        if self.proxy_pool is not None and self.proxy_pool.running:
+            return
+        self.start_proxy_pool(is_restart=True)
+
     def _proxy_pool_finished(self) -> None:
         def apply() -> None:
             self.proxy_pool = None
             self._proxy_pool_testing = False
+            if self._proxy_pool_want_running:
+                self.settings.set_pool_inputs_enabled(False)
+                self.pool_test_btn.configure(state="normal")
+                self._update_proxy_pool_status([])
+                self._schedule_proxy_pool_restart()
+                return
             self.pool_btn.configure(text="Start proxy pool", state="normal")
             self.pool_test_btn.configure(state="normal")
             self.settings.set_pool_inputs_enabled(True)
@@ -1233,6 +1514,11 @@ class App:
 
     def _on_close(self) -> None:
         self._save_ui_config()
+        for key, job in list(self.jobs.items()):
+            job.want_running = False
+            self._cancel_job_restart(key)
+        self._proxy_pool_want_running = False
+        self._cancel_proxy_pool_restart()
         running = [k for k, j in self.jobs.items() if j.running]
         pool_running = self.proxy_pool is not None and self.proxy_pool.running
         if running or pool_running:

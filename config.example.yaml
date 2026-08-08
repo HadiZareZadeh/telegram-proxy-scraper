@@ -114,4 +114,8 @@ gui:
   proxy_open_top: 10
   # Vertical split: fraction of window for tabs (rest is log + input)
   main_pane_ratio: 0.65
+  # Long-running jobs (scraper, subscription server, proxy pool) restart on
+  # unexpected exit forever: delay = min(max, base * 2^attempt), then cleanup + re-run.
+  restart_backoff_sec: 2
+  restart_backoff_max_sec: 30
 

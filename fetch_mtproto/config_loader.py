@@ -59,6 +59,8 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("gui", "auto_start_proxy_pool", "GUI_AUTO_START_PROXY_POOL"),
     ("gui", "proxy_open_top", "GUI_PROXY_OPEN_TOP"),
     ("gui", "main_pane_ratio", "GUI_MAIN_PANE_RATIO"),
+    ("gui", "restart_backoff_sec", "GUI_RESTART_BACKOFF_SEC"),
+    ("gui", "restart_backoff_max_sec", "GUI_RESTART_BACKOFF_MAX_SEC"),
     ("proxy_pool", "start_port", "PROXY_POOL_START_PORT"),
     ("proxy_pool", "count", "PROXY_POOL_COUNT"),
     ("proxy_pool", "switch_interval_sec", "PROXY_POOL_SWITCH_INTERVAL_SEC"),
