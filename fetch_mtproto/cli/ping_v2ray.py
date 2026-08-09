@@ -8,7 +8,6 @@ import sys
 from fetch_mtproto.cancel import CancelScope
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import load_config
-from fetch_mtproto.prune import probe_kwargs_from_config
 from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
 from fetch_mtproto.v2ray.port_cleanup import cleanup_ping_xray
 from fetch_mtproto.v2ray.settings import v2ray_test_kwargs
@@ -24,10 +23,6 @@ def _print_fastest(fastest) -> None:
     print(f"  {server.to_link()}")
     print(f"  latency: {latency * 1000:.0f} ms")
     print(f"  endpoint: {server.scheme}://{server.host}:{server.port}")
-
-
-def _probe_kwargs(config) -> dict:
-    return probe_kwargs_from_config(config)
 
 
 def _print_run_summary(stats, summary) -> None:
@@ -51,11 +46,9 @@ def _print_run_summary(stats, summary) -> None:
 async def run(config, best: list) -> None:
     db, _mt, catalog = open_catalogs(config)
     try:
-        probe_kw = _probe_kwargs(config)
-        queue = catalog.probe_queue(**probe_kw)
+        servers = catalog.all_unique()
         working, failed = catalog.counts()
-        total_unique = len(catalog.all_unique())
-        if not queue:
+        if not servers:
             print(f"No V2Ray links found in {db.path}")
             return
 
@@ -70,18 +63,19 @@ async def run(config, best: list) -> None:
 
         summary = db.v2ray_health_summary()
         non_xray = sorted(set(V2RAY_SCHEMES) - set(XRAY_SCHEMES))
+        api_port = kwargs["base_port"] + kwargs["concurrency"]
         print(
-            f"Adaptive probe queue: {len(queue)}/{total_unique} "
+            f"Full catalog probe: {len(servers)} servers "
             f"(working={working}, failed={failed}; "
             f"lifetime ok={summary['successes']} fail={summary['failures']})\n"
-            f"via {kwargs['test_url']} through {kwargs['xray_bin']}\n"
+            f"via {kwargs['test_url']} through 1 shared Xray process "
+            f"({kwargs['xray_bin']})\n"
             f"concurrency={kwargs['concurrency']}  "
             f"ports={kwargs['base_port']}–"
             f"{kwargs['base_port'] + kwargs['concurrency'] - 1}  "
+            f"api={api_port}  "
             f"timeout={kwargs['timeout']}s\n"
-            f"Order: highest priority_score first "
-            f"(backoff={'on' if probe_kw['respect_backoff'] else 'off'}"
-            f"{', failed cap={}'.format(probe_kw['failed_limit']) if probe_kw.get('failed_limit') else ''})\n"
+            f"Order: catalog all_unique (no failed cap / backoff skip)\n"
             f"Xray-testable schemes only: {', '.join(sorted(XRAY_SCHEMES))} "
             f"(skipped in catalog: {', '.join(non_xray)})\n"
         )
@@ -111,7 +105,6 @@ async def run(config, best: list) -> None:
                 on_result=on_result,
                 cancel_event=cancel_event,
                 **kwargs,
-                **probe_kw,
             )
         best[0] = stats.fastest
         summary = db.v2ray_health_summary()

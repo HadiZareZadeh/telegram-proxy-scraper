@@ -22,7 +22,7 @@ def _q(qs: dict[str, list[str]], name: str, default: str = "") -> str:
 
 def _stream_settings_from_query(
     qs: dict[str, list[str]], *, default_security: str = ""
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     network = (_q(qs, "type") or _q(qs, "network") or "tcp").lower()
     security = (_q(qs, "security") or default_security or "none").lower()
     if security in {"", "none", "0"}:
@@ -36,7 +36,7 @@ def _stream_settings_from_query(
     alpn = [p.strip() for p in alpn_raw.split(",") if p.strip()] if alpn_raw else None
 
     if security == "tls":
-        tls: dict[str, Any] = {"allowInsecure": True}
+        tls: dict[str, Any] = {}
         if sni:
             tls["serverName"] = sni
         if fingerprint:
@@ -45,10 +45,14 @@ def _stream_settings_from_query(
             tls["alpn"] = alpn
         stream["tlsSettings"] = tls
     elif security == "reality":
+        # Newer Xray uses "password" (pbk in share links); publicKey remains an alias.
+        password = _q(qs, "pbk") or _q(qs, "password") or _q(qs, "pwd")
+        if not password:
+            return None
         stream["realitySettings"] = {
             "serverName": sni or _q(qs, "host"),
             "fingerprint": fingerprint or "chrome",
-            "publicKey": _q(qs, "pbk"),
+            "password": password,
             "shortId": _q(qs, "sid"),
             "spiderX": _q(qs, "spx") or "",
         }
@@ -127,7 +131,6 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
     if stream["security"] == "tls":
         stream["tlsSettings"] = {
             "serverName": sni or host,
-            "allowInsecure": True,
             "fingerprint": str(obj.get("fp") or "chrome"),
         }
 
@@ -183,6 +186,10 @@ def _outbound_vless(server: V2RayServer) -> dict[str, Any] | None:
     if flow:
         user["flow"] = flow
 
+    stream = _stream_settings_from_query(qs)
+    if stream is None:
+        return None
+
     return {
         "protocol": "vless",
         "settings": {
@@ -194,7 +201,7 @@ def _outbound_vless(server: V2RayServer) -> dict[str, Any] | None:
                 }
             ]
         },
-        "streamSettings": _stream_settings_from_query(qs),
+        "streamSettings": stream,
     }
 
 
@@ -206,6 +213,9 @@ def _outbound_trojan(server: V2RayServer) -> dict[str, Any] | None:
     if not parsed.hostname or parsed.port is None or not password:
         return None
     qs = parse_qs(parsed.query)
+    stream = _stream_settings_from_query(qs, default_security="tls")
+    if stream is None:
+        return None
     return {
         "protocol": "trojan",
         "settings": {
@@ -217,7 +227,7 @@ def _outbound_trojan(server: V2RayServer) -> dict[str, Any] | None:
                 }
             ]
         },
-        "streamSettings": _stream_settings_from_query(qs, default_security="tls"),
+        "streamSettings": stream,
     }
 
 
@@ -412,7 +422,7 @@ def build_xray_routed_config(
         config["stats"] = {}
         config["api"] = {
             "tag": "api",
-            "services": ["StatsService"],
+            "services": ["HandlerService", "StatsService"],
         }
         config["policy"] = {
             "system": {

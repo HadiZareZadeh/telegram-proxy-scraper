@@ -32,11 +32,14 @@ from fetch_mtproto.v2ray.port_cleanup import (
 from fetch_mtproto.v2ray.store import V2RayServer, _server_from_row, is_nekoray_compatible
 from fetch_mtproto.v2ray.xray import (
     XRAY_SCHEMES,
-    XrayRouteEntry,
     build_xray_multi_pool_config,
-    build_xray_routed_config,
     format_traffic_bytes,
     link_to_xray_outbound,
+)
+from fetch_mtproto.v2ray.xray_session import (
+    XrayLiveSession,
+    pool_test_api_port,
+    pool_test_live_slot,
 )
 
 LogFn = Callable[[str], None]
@@ -150,15 +153,17 @@ class ProxyPoolRunner:
         self._previous_keys: list[str] = []
         self._current_keys: list[str] = []
 
-        # Shared pool process (all 10801+ slots) + dedicated validation process.
+        # Shared pool process (all 10801+ slots) + long-lived validation session.
         self._pool_process: subprocess.Popen | None = None
         self._pool_cfg_path: Path | None = None
         self._api_port = self.start_port + API_PORT_OFFSET
-        self._test_process: subprocess.Popen | None = None
-        self._test_cfg_path: Path | None = None
+        self._test_session: XrayLiveSession | None = None
         test_ports = pool_test_ports(self.test_base_port)
         self._test_socks_port = test_ports[0]
         self._test_http_port = test_ports[1]
+        self._test_api_port = test_ports[2] if len(test_ports) > 2 else pool_test_api_port(
+            self.test_base_port
+        )
 
     @property
     def running(self) -> bool:
@@ -229,6 +234,11 @@ class ProxyPoolRunner:
             self._usage.clear()
             self._previous_keys = []
             self._current_keys = []
+            if not self._ensure_test_session():
+                self._log(
+                    "[proxy pool] continuing without a pre-started test xray "
+                    "(will retry when validating candidates)"
+                )
 
             while not self._stop_event.is_set():
                 self._refresh_servers()
@@ -558,10 +568,14 @@ class ProxyPoolRunner:
             except OSError:
                 pass
 
-    def _stop_test_process(self) -> None:
-        self._stop_process(self._test_process, self._test_cfg_path)
-        self._test_process = None
-        self._test_cfg_path = None
+    def _stop_test_session(self) -> None:
+        session = self._test_session
+        self._test_session = None
+        if session is not None:
+            try:
+                session.stop()
+            except Exception:
+                pass
 
     def _stop_pool_process(self) -> None:
         self._commit_all_traffic()
@@ -589,6 +603,37 @@ class ProxyPoolRunner:
             raise
         return proc, cfg_path
 
+    def _ensure_test_session(self) -> bool:
+        """Start (or reuse) the long-lived validation Xray used between candidates."""
+        if self._test_session is not None and self._test_session.running:
+            return True
+        if not self._bin_path:
+            return False
+        self._stop_test_session()
+        if self._stop_event.is_set():
+            return False
+        slot = pool_test_live_slot(self.test_base_port)
+        self._test_socks_port = int(slot.socks_port or self.test_base_port)
+        self._test_http_port = int(slot.http_port or (self.test_base_port + 1))
+        self._test_api_port = pool_test_api_port(self.test_base_port)
+        session = XrayLiveSession(
+            bin_path=self._bin_path,
+            slots=[slot],
+            api_port=self._test_api_port,
+            prefix="fetch-mtproto-pool-test",
+        )
+        try:
+            session.start(ready_timeout=12.0)
+        except Exception as exc:
+            self._log(f"[proxy pool] test xray failed to start: {exc}")
+            try:
+                session.stop()
+            except Exception:
+                pass
+            return False
+        self._test_session = session
+        return True
+
     def _validate_on_test_process(
         self,
         server: V2RayServer,
@@ -596,7 +641,7 @@ class ProxyPoolRunner:
         allow_slow: bool = False,
         skip_live_test: bool = False,
     ) -> tuple[SlotStartResult, str | None]:
-        """Validate a candidate on the dedicated test Xray process (not pool ports)."""
+        """Validate a candidate on the long-lived test Xray (not pool ports)."""
         if self._stop_event.is_set():
             return "failed", "stopped"
 
@@ -613,41 +658,25 @@ class ProxyPoolRunner:
         if outbound is None:
             return "failed", f"unsupported scheme: {server.scheme}"
 
-        self._stop_test_process()
-        if self._stop_event.is_set():
-            return "failed", "stopped"
-
-        config = build_xray_routed_config(
-            [
-                XrayRouteEntry(
-                    outbound=outbound,
-                    tag="proxy-test",
-                    socks_port=self._test_socks_port,
-                    http_port=self._test_http_port,
-                )
-            ]
-        )
-        try:
-            proc, cfg_path = self._start_xray(config, prefix="fetch-mtproto-pool-test")
-        except OSError as exc:
-            return "failed", f"xray start failed: {exc}"
-
-        self._test_process = proc
-        self._test_cfg_path = cfg_path
-
-        if self._stop_event.is_set():
-            self._stop_test_process()
-            return "failed", "stopped"
-
-        if not self._wait_port("127.0.0.1", self._test_http_port, timeout=8.0):
-            self._stop_test_process()
+        if not self._ensure_test_session():
             if self._stop_event.is_set():
                 return "failed", "stopped"
-            return "failed", "test HTTP port did not open"
+            return "failed", "test xray not available"
+        if self._stop_event.is_set():
+            return "failed", "stopped"
+
+        assert self._test_session is not None
+        try:
+            self._test_session.set_slot_outbound(0, outbound)
+        except Exception as exc:
+            detail = str(exc) or type(exc).__name__
+            self._record_probe(server, ok=False, latency_s=None, error=detail)
+            return "failed", f"outbound swap failed: {detail}"
+
+        if self._stop_event.is_set():
+            return "failed", "stopped"
 
         ok, latency_s, error = self._validate_upstream(self._test_http_port)
-        # Keep test process only while validating; free ports between candidates.
-        self._stop_test_process()
 
         if not ok or latency_s is None:
             detail = error or "upstream check failed"
@@ -897,12 +926,11 @@ class ProxyPoolRunner:
                 self._record_usage(assigned)
         finally:
             self._assigning_slots = False
-            self._stop_test_process()
 
         running = sum(1 for slot in slots if self._slot_is_healthy(slot))
         self._log(
             f"[proxy pool] {running}/{len(slots)} slot(s) running with "
-            f"validated upstreams (1 pool xray + 1 test xray)"
+            f"validated upstreams (1 pool xray + 1 long-lived test xray)"
         )
 
     def _repair_dead_slots(self) -> None:
@@ -965,7 +993,6 @@ class ProxyPoolRunner:
             if assigned:
                 self._record_usage(assigned)
             self._emit_status()
-        self._stop_test_process()
 
     def _commit_all_traffic(self) -> None:
         with self._slots_lock:
@@ -1066,7 +1093,7 @@ class ProxyPoolRunner:
         return {index: (pair[0], pair[1]) for index, pair in by_index.items()}
 
     def _kill_all_processes(self) -> None:
-        self._stop_test_process()
+        self._stop_test_session()
         self._stop_pool_process()
 
     def _cleanup_all(self) -> None:

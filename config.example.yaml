@@ -47,12 +47,12 @@ v2ray:
   test_url: http://www.gstatic.com/generate_204
   test_bytes: 0
   test_timeout: 8.0
-  # Servers per batch / local SOCKS ports used by one shared Ping Xray process
+  # Servers probed in parallel on one long-lived Ping Xray (local SOCKS ports + Handler API)
   ping_concurrency: 20
-  # Local SOCKS ports for each Ping V2Ray batch: base .. base+concurrency-1
+  # Local SOCKS ports for Ping V2Ray: base .. base+concurrency-1 (API at base+concurrency)
   # Kept far from proxy_pool.start_port so leftovers can be killed by range.
   ping_base_port: 45001
-  # Stop probing once this many working servers are found (0 = unlimited)
+  # Cap working set size after a full-catalog probe (0 = unlimited)
   max_working: 300
   # Fastest, most recently checked working servers exported to subscription.txt (0 = unlimited)
   subscription_limit: 100
@@ -79,15 +79,16 @@ mtproto:
   max_working: 1000
 
 probe:
-  # Adaptive probe scheduler (explore / exploit / recover)
-  # Skip chronic failures until their backoff window expires.
+  # Adaptive probe scheduler for MTProto (explore / exploit / recover)
+  # V2Ray Ping always probes the full catalog on one shared Xray process.
+  # Skip chronic MTProto failures until their backoff window expires.
   respect_backoff: true
   # Drop dead servers so ping runs stay fast (applied after each check + at startup)
   prune_after_failures: 8      # consecutive failures with zero lifetime successes
   prune_min_checks: 5          # minimum probes before a server can be pruned
   prune_stale_days: 14         # remove failed servers not checked in this many days
   max_failed: 2000             # cap failed rows kept in DB (0 = unlimited)
-  failed_limit: 500            # max failed servers to re-probe per run (0 = unlimited; working always probed)
+  failed_limit: 500            # max failed MTProto servers to re-probe per run (0 = unlimited; working always probed)
   prune_incompatible_v2ray: true  # delete xhttp / splithttp / raw (Nekoray-incompatible)
 
 proxy_pool:

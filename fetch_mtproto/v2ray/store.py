@@ -508,7 +508,10 @@ class V2RayCatalog:
                 continue
             # Never record "can't test with Xray" as a real probe failure.
             err = getattr(result, "error", None) or ""
-            if not result.ok and "unsupported scheme" in err.lower():
+            if not result.ok and (
+                "unsupported scheme" in err.lower()
+                or "invalid xray outbound" in err.lower()
+            ):
                 continue
             identity = server.as_db_row()
             if result.ok and result.latency is not None:

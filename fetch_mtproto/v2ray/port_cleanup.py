@@ -20,26 +20,28 @@ DEFAULT_POOL_TEST_BASE_PORT = 44001
 PORTS_PER_POOL_SLOT = 2
 # Single Stats API for the shared pool Xray process.
 POOL_API_PORT_OFFSET = 10000
-PORTS_PER_POOL_TEST = 2
+# SOCKS + HTTP + Handler API for the long-lived pool validation Xray.
+PORTS_PER_POOL_TEST = 3
 
 _XRAY_NAMES = frozenset({"xray", "xray.exe"})
 
 
 def ping_ports(base_port: int, concurrency: int) -> list[int]:
-    """Local SOCKS ports used by one Ping V2Ray batch (single Xray process)."""
+    """Local SOCKS ports + Handler API for one long-lived Ping Xray process."""
     base = max(1024, int(base_port))
     count = max(1, int(concurrency))
-    last = base + count - 1
+    api = base + count
+    last = api
     if last > 65535:
         raise ValueError(
             f"Ping port range {base}–{last} exceeds 65535 "
             f"(base={base}, concurrency={count})"
         )
-    return list(range(base, base + count))
+    return list(range(base, base + count)) + [api]
 
 
 def pool_test_ports(base_port: int = DEFAULT_POOL_TEST_BASE_PORT) -> list[int]:
-    """SOCKS + HTTP ports for the proxy-pool validation Xray process."""
+    """SOCKS + HTTP + Handler API for the proxy-pool validation Xray process."""
     base = max(1024, int(base_port))
     last = base + PORTS_PER_POOL_TEST - 1
     if last > 65535:

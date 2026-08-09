@@ -122,7 +122,7 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
                 20,
                 minimum=1,
                 maximum=64,
-                hint="Servers (and local SOCKS ports) per shared Ping Xray process.",
+                hint="Servers probed in parallel on one long-lived Ping Xray (SOCKS ports).",
             ),
             ConfigField(
                 "v2ray",
@@ -132,7 +132,7 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
                 45001,
                 minimum=1024,
                 maximum=65000,
-                hint="First SOCKS port of the Ping batch window.",
+                hint="First SOCKS port; API uses base+concurrency.",
             ),
             ConfigField(
                 "v2ray",
@@ -141,7 +141,7 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
                 "int",
                 300,
                 minimum=0,
-                hint="0 = unlimited.",
+                hint="Trim working set after full-catalog probe. 0 = unlimited.",
             ),
             ConfigField(
                 "v2ray",
@@ -234,7 +234,7 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
     (
         "Probe",
         (
-            ConfigField("probe", "respect_backoff", "Respect failure backoff", "bool", True),
+            ConfigField("probe", "respect_backoff", "Respect failure backoff", "bool", True, hint="MTProto probe queue only."),
             ConfigField(
                 "probe",
                 "prune_after_failures",
@@ -257,11 +257,11 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
             ConfigField(
                 "probe",
                 "failed_limit",
-                "Max failed re-probes per run",
+                "Max failed MTProto re-probes per run",
                 "int",
                 500,
                 minimum=0,
-                hint="0 = unlimited; working servers are always probed.",
+                hint="MTProto only. 0 = unlimited; working always probed. V2Ray Ping tests the full catalog.",
             ),
             ConfigField(
                 "probe",

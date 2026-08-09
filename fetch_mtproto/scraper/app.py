@@ -330,7 +330,6 @@ async def periodic_checks(
         timeout = getattr(config, "PING_TIMEOUT", 8.0)
         v2_kwargs = v2ray_test_kwargs(config)
         mt_probe_kw = probe_kwargs_from_config(config)
-        v2_probe_kw = probe_kwargs_from_config(config)
 
         def _mt_progress(done: int, total_n: int, result) -> None:
             if result.ok and result.latency is not None:
@@ -387,8 +386,7 @@ async def periodic_checks(
                 )
 
                 log.info(
-                    "Scheduled V2Ray check (%d in probe queue / %d unique) via %s …",
-                    len(v2_catalog.probe_queue(**v2_probe_kw)),
+                    "Scheduled V2Ray check (%d unique, full catalog) via %s …",
                     len(v2_catalog.all_unique()),
                     v2_kwargs["test_url"],
                 )
@@ -402,7 +400,6 @@ async def periodic_checks(
                         v2_catalog,
                         on_result=_v2_progress,
                         **v2_kwargs,
-                        **v2_probe_kw,
                     )
                     v2_ok, v2_fail = v2_catalog.counts()
                     log.info(
