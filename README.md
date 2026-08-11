@@ -10,13 +10,14 @@ fetch-mtproto/
 ├── setup.cmd                # Windows installer (Python, deps, Xray, config)
 ├── setup.sh                 # Linux installer (same steps as setup.cmd)
 ├── config.example.yaml → config.yaml
+├── urls.txt             # HTTP(S) V2Ray list sources (GitHub raw, etc.)
 ├── requirements.txt
 ├── fetch_mtproto/           # application package
 │   ├── gui/                 # Tkinter control panel
 │   ├── cli/                 # task implementations run by the GUI
 │   ├── scraper/             # Telegram scrape / watch
 │   ├── mtproto/             # parse + ping
-│   ├── v2ray/               # parse, Xray ping, subscription export
+│   ├── v2ray/               # parse, Xray ping, subscription export, URL sources
 │   ├── catalogs.py          # open SQLite + legacy import
 │   ├── db.py                # SQLite schema / access
 │   ├── config_loader.py
@@ -66,9 +67,10 @@ The control panel provides:
 
 | Button | What it does |
 |--------|--------------|
-| Start Scraper | Connects to Telegram, scans sources, watches for new posts (login prompts answered in the input box) |
+| Start Scraper | Connects to Telegram, scans sources, watches for new posts (login prompts answered in the input box). Also fetches `urls.txt` on start / on interval. |
 | Ping MTProto | Tests all MTProto proxies and reorganizes working/failed in the DB |
 | Ping V2Ray | Tests all V2Ray servers through Xray and reorganizes the DB |
+| URL sources | Fetches V2Ray lists from `urls.txt` into the catalog (loops on `url_sources.fetch_interval`) |
 | Start Subscription server | Rebuilds `data/subscription.txt` and serves it on your LAN (default `http://<your-ip>:8765/subscription.txt`). A QR code appears in the panel for easy import on phones. |
 | Open top N proxies | Opens the fastest working MTProto links in Telegram Desktop |
 
@@ -113,10 +115,13 @@ Optional `MTPROTO_MAX_WORKING` / `V2RAY_MAX_WORKING` cap how many top-scoring se
 ## Behavior
 
 1. Scraper prefers an MTProto proxy; falls back to a direct connection if none work.
-2. Scans recent messages for MTProto and V2Ray share URIs.
-3. Inserts new unique links into SQLite as working.
-4. Stays online for new posts.
-5. On `PROXY_CHECK_INTERVAL` (default 30 minutes), re-pings both catalogs.
+2. On start (and every `url_sources.fetch_interval`), fetches V2Ray lists from `urls.txt` into the catalog.
+3. Scans recent Telegram messages for MTProto and V2Ray share URIs.
+4. Inserts new unique links into SQLite as working.
+5. Stays online for new posts.
+6. On `PROXY_CHECK_INTERVAL` (default 5 minutes), re-pings both catalogs.
+
+Edit `urls.txt` (one HTTP(S) URL per line) to control GitHub / subscription sources. Use the **URL sources** job in the GUI to run that fetch without Telegram, or leave it to the scraper.
 
 V2Ray health checks spin up a short-lived local Xray SOCKS inbound per server and HTTP-ping `V2RAY_TEST_URL`. Schemes Xray can outbound (`vmess`, `vless`, `trojan`, `ss`) are tested; others are marked failed as unsupported.
 

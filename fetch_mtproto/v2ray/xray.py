@@ -12,6 +12,8 @@ from fetch_mtproto.v2ray.store import (
     V2RayServer,
     _b64decode,
     _safe_json,
+    normalize_stream_security,
+    vmess_stream_security,
 )
 
 
@@ -20,13 +22,31 @@ def _q(qs: dict[str, list[str]], name: str, default: str = "") -> str:
     return unquote(vals[0]) if vals else default
 
 
+def _safe_parsed_host_port(parsed) -> tuple[str | None, int | None]:
+    """urlparse(...).port raises ValueError on garbage like unbracketed IPv6."""
+    try:
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None, None
+    if host is None or port is None:
+        return host, None
+    try:
+        port_i = int(port)
+    except (TypeError, ValueError):
+        return host, None
+    if not (1 <= port_i <= 65535):
+        return host, None
+    return host, port_i
+
+
 def _stream_settings_from_query(
     qs: dict[str, list[str]], *, default_security: str = ""
 ) -> dict[str, Any] | None:
     network = (_q(qs, "type") or _q(qs, "network") or "tcp").lower()
-    security = (_q(qs, "security") or default_security or "none").lower()
-    if security in {"", "none", "0"}:
-        security = "none"
+    security = normalize_stream_security(_q(qs, "security") or default_security or "none")
+    if security is None:
+        return None
 
     stream: dict[str, Any] = {"network": network, "security": security}
 
@@ -56,6 +76,8 @@ def _stream_settings_from_query(
             "shortId": _q(qs, "sid"),
             "spiderX": _q(qs, "spx") or "",
         }
+    elif security not in {"none", "xtls"}:
+        return None
 
     if network == "ws":
         stream["wsSettings"] = {
@@ -119,13 +141,13 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
         alter_id = 0
 
     network = str(obj.get("net") or "tcp").lower()
-    security = str(obj.get("tls") or obj.get("security") or "none").lower()
-    if security in {"", "0"}:
-        security = "none"
+    security = vmess_stream_security(obj)
+    if security is None:
+        return None
 
     stream: dict[str, Any] = {
         "network": network,
-        "security": security if security else "none",
+        "security": security,
     }
     sni = str(obj.get("sni") or obj.get("host") or "").strip()
     if stream["security"] == "tls":
@@ -133,6 +155,18 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
             "serverName": sni or host,
             "fingerprint": str(obj.get("fp") or "chrome"),
         }
+    elif stream["security"] not in {"none", "xtls"}:
+        # REALITY/other modes need dedicated settings; skip unbuildable configs.
+        return None
+
+    # Cipher field is `scy`; some links misuse `security` for the cipher name.
+    cipher = str(obj.get("scy") or "").strip()
+    if not cipher:
+        maybe_cipher = str(obj.get("security") or "").strip().lower()
+        if maybe_cipher and normalize_stream_security(maybe_cipher) is None:
+            cipher = maybe_cipher
+    if not cipher:
+        cipher = "auto"
 
     if network == "ws":
         stream["wsSettings"] = {
@@ -163,7 +197,7 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
                         {
                             "id": uuid,
                             "alterId": alter_id,
-                            "security": str(obj.get("scy") or "auto"),
+                            "security": cipher,
                         }
                     ],
                 }
@@ -175,7 +209,10 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
 
 def _outbound_vless(server: V2RayServer) -> dict[str, Any] | None:
     parsed = urlparse(server.link)
-    if not parsed.hostname or parsed.port is None or not parsed.username:
+    host, port = _safe_parsed_host_port(parsed)
+    if host is None or port is None:
+        host, port = server.host, server.port
+    if not host or not (1 <= int(port) <= 65535) or not parsed.username:
         return None
     qs = parse_qs(parsed.query)
     user: dict[str, Any] = {
@@ -195,8 +232,8 @@ def _outbound_vless(server: V2RayServer) -> dict[str, Any] | None:
         "settings": {
             "vnext": [
                 {
-                    "address": parsed.hostname,
-                    "port": int(parsed.port),
+                    "address": host,
+                    "port": int(port),
                     "users": [user],
                 }
             ]
@@ -210,7 +247,10 @@ def _outbound_trojan(server: V2RayServer) -> dict[str, Any] | None:
     password = unquote(parsed.username or "")
     if parsed.password:
         password = f"{password}:{unquote(parsed.password)}"
-    if not parsed.hostname or parsed.port is None or not password:
+    host, port = _safe_parsed_host_port(parsed)
+    if host is None or port is None:
+        host, port = server.host, server.port
+    if not host or not (1 <= int(port) <= 65535) or not password:
         return None
     qs = parse_qs(parsed.query)
     stream = _stream_settings_from_query(qs, default_security="tls")
@@ -221,8 +261,8 @@ def _outbound_trojan(server: V2RayServer) -> dict[str, Any] | None:
         "settings": {
             "servers": [
                 {
-                    "address": parsed.hostname,
-                    "port": int(parsed.port),
+                    "address": host,
+                    "port": int(port),
                     "password": password,
                 }
             ]
@@ -253,9 +293,10 @@ def _outbound_ss(server: V2RayServer) -> dict[str, Any] | None:
     host = ""
     port = 0
 
-    if parsed.hostname and parsed.port:
-        host = parsed.hostname
-        port = int(parsed.port)
+    parsed_host, parsed_port = _safe_parsed_host_port(parsed)
+    if parsed_host and parsed_port:
+        host = parsed_host
+        port = parsed_port
         userinfo = parsed.username or ""
         if parsed.password:
             userinfo = f"{userinfo}:{parsed.password}"
@@ -282,10 +323,16 @@ def _outbound_ss(server: V2RayServer) -> dict[str, Any] | None:
         method, password = parts
         if hostport.startswith("[") and "]:" in hostport:
             host = hostport[1 : hostport.index("]")]
-            port = int(hostport.split("]:", 1)[1])
+            try:
+                port = int(hostport.split("]:", 1)[1])
+            except ValueError:
+                return None
         else:
-            host, port_s = hostport.rsplit(":", 1)
-            port = int(port_s)
+            try:
+                host, port_s = hostport.rsplit(":", 1)
+                port = int(port_s)
+            except ValueError:
+                return None
 
     if not host or not method or not password or not (1 <= port <= 65535):
         return None
@@ -308,14 +355,17 @@ def _outbound_ss(server: V2RayServer) -> dict[str, Any] | None:
 def link_to_xray_outbound(server: V2RayServer) -> dict[str, Any] | None:
     if server.scheme not in XRAY_SCHEMES:
         return None
-    if server.scheme == "vmess":
-        return _outbound_vmess(server)
-    if server.scheme == "vless":
-        return _outbound_vless(server)
-    if server.scheme == "trojan":
-        return _outbound_trojan(server)
-    if server.scheme == "ss":
-        return _outbound_ss(server)
+    try:
+        if server.scheme == "vmess":
+            return _outbound_vmess(server)
+        if server.scheme == "vless":
+            return _outbound_vless(server)
+        if server.scheme == "trojan":
+            return _outbound_trojan(server)
+        if server.scheme == "ss":
+            return _outbound_ss(server)
+    except (ValueError, TypeError, IndexError, UnicodeError, KeyError):
+        return None
     return None
 
 

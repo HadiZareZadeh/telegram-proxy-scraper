@@ -634,10 +634,13 @@ class CatalogDB:
         if failed_count <= max_failed:
             return 0
         excess = failed_count - max_failed
+        # Prefer deleting probed chronic failures; only drop never-checked candidates
+        # after those are exhausted (URL-source imports rely on this).
         keys = self.conn.execute(
             f"""
             SELECT key FROM {table}
             WHERE status = 'failed'
+              AND check_count > 0
             ORDER BY priority_score ASC,
                      CASE WHEN last_checked_at IS NULL THEN 1 ELSE 0 END,
                      last_checked_at ASC,
@@ -646,6 +649,19 @@ class CatalogDB:
             """,
             (excess,),
         ).fetchall()
+        if len(keys) < excess:
+            remaining = excess - len(keys)
+            more = self.conn.execute(
+                f"""
+                SELECT key FROM {table}
+                WHERE status = 'failed'
+                  AND check_count = 0
+                ORDER BY priority_score ASC, key
+                LIMIT ?
+                """,
+                (remaining,),
+            ).fetchall()
+            keys = list(keys) + list(more)
         if not keys:
             return 0
         placeholders = ",".join("?" * len(keys))
@@ -765,6 +781,35 @@ class CatalogDB:
                 (key, scheme, link, host, port, identity, network, security, sni),
             )
             added += 1
+        self.conn.commit()
+        return added
+
+    def v2ray_insert_new(self, rows: Iterable[tuple]) -> int:
+        """Insert only unknown keys as working explore candidates (never revive known rows)."""
+        added = 0
+        cur = self.conn.cursor()
+        for (
+            key,
+            scheme,
+            link,
+            host,
+            port,
+            identity,
+            network,
+            security,
+            sni,
+        ) in rows:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO v2ray (
+                    key, scheme, link, host, port, identity, network, security, sni,
+                    status, sort_order, priority_score
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'working', 0, 1000)
+                """,
+                (key, scheme, link, host, port, identity, network, security, sni),
+            )
+            added += cur.rowcount
         self.conn.commit()
         return added
 

@@ -41,10 +41,36 @@ _V2RAY_URL_RE = re.compile(
 
 # Transports Nekoray v3.26 cannot use (Xray splithttp/xhttp, raw socket).
 NEKORAY_INCOMPATIBLE_NETWORKS = frozenset({"xhttp", "splithttp", "raw"})
+# Stream TLS modes Xray accepts (not VMess cipher names like "auto").
+XRAY_STREAM_SECURITIES = frozenset({"none", "tls", "reality", "xtls"})
 _NETWORK_FROM_LINK_RE = re.compile(
     r"(?:^|[?&])(?:type|network|obfs)=([^&\s#]+)",
     re.IGNORECASE,
 )
+
+
+def normalize_stream_security(raw: str | None) -> str | None:
+    """Return a known stream security, or None if the value is invalid/unknown."""
+    sec = (raw or "").strip().lower()
+    if sec in {"", "0", "none"}:
+        return "none"
+    if sec in XRAY_STREAM_SECURITIES:
+        return sec
+    return None
+
+
+def vmess_stream_security(obj: dict) -> str | None:
+    """VMess JSON: prefer `tls`; only treat `security` as stream TLS when it is a known mode."""
+    tls = str(obj.get("tls") or "").strip().lower()
+    if tls in {"", "0"}:
+        tls = ""
+    if tls:
+        return normalize_stream_security(tls)
+    sec = str(obj.get("security") or "").strip().lower()
+    if sec in XRAY_STREAM_SECURITIES or sec in {"", "0"}:
+        return normalize_stream_security(sec)
+    # `security` / missing tls often holds the cipher (e.g. "auto") — not stream TLS.
+    return "none"
 
 
 def _b64decode(data: str) -> bytes:
@@ -166,7 +192,11 @@ def parse_vmess(link: str) -> V2RayServer | None:
         return None
     identity = str(obj.get("id") or "").strip()
     network = str(obj.get("net") or obj.get("type") or "").strip()
-    security = str(obj.get("tls") or obj.get("security") or "").strip()
+    security = vmess_stream_security(obj)
+    if security is None:
+        return None
+    if security == "none":
+        security = ""
     sni = str(obj.get("sni") or obj.get("host") or obj.get("peer") or "").strip()
     return V2RayServer(
         scheme="vmess",
@@ -188,9 +218,14 @@ def parse_ss(link: str) -> V2RayServer | None:
         return None
 
     # SIP002: ss://base64(method:password)@host:port
-    if parsed.hostname and parsed.port:
-        host = parsed.hostname.lower()
-        port = int(parsed.port)
+    try:
+        hostname = parsed.hostname
+        port_val = parsed.port
+    except ValueError:
+        return None
+    if hostname and port_val:
+        host = hostname.lower()
+        port = int(port_val)
         userinfo = unquote(parsed.username or "")
         if parsed.password:
             userinfo = f"{userinfo}:{unquote(parsed.password)}"
@@ -268,13 +303,12 @@ def parse_uri_scheme(link: str, scheme: str) -> V2RayServer | None:
     if parsed.scheme.lower() != scheme:
         return None
 
-    # urlparse(...).port raises ValueError on non-numeric ports (e.g. ':qf}')
+    # urlparse(...).port raises ValueError on non-numeric / unbracketed-IPv6 junk
     try:
         hostname = parsed.hostname
         port_val = parsed.port
     except ValueError:
-        hostname = None
-        port_val = None
+        return None
 
     if not hostname or port_val is None:
         hp = _host_port_from_netloc(parsed.netloc)
@@ -298,11 +332,15 @@ def parse_uri_scheme(link: str, scheme: str) -> V2RayServer | None:
         return unquote(vals[0]) if vals else ""
 
     network = q("type") or q("network") or q("obfs")
-    security = q("security") or q("tls")
-    if not security and (
+    security_raw = q("security") or q("tls")
+    if not security_raw and (
         scheme in {"trojan", "hysteria", "hysteria2", "tuic"} or q("sni")
     ):
-        security = "tls"
+        security_raw = "tls"
+    security_norm = normalize_stream_security(security_raw) if security_raw else "none"
+    if security_norm is None:
+        return None
+    security = "" if security_norm == "none" else security_norm
     sni = q("sni") or q("peer") or q("host")
 
     return V2RayServer(
@@ -350,14 +388,34 @@ def is_nekoray_compatible(server: V2RayServer) -> bool:
     return normalized_network(server) not in NEKORAY_INCOMPATIBLE_NETWORKS
 
 
-def extract_v2ray_from_text(text: str) -> list[V2RayServer]:
+def is_importable_v2ray(server: V2RayServer) -> bool:
+    """True when the server uses an Xray-testable scheme and builds a valid outbound."""
+    if server.scheme not in XRAY_SCHEMES:
+        return False
+    if not is_nekoray_compatible(server):
+        return False
+    # Lazy import avoids a store <-> xray cycle at module load.
+    from fetch_mtproto.v2ray.xray import link_to_xray_outbound
+
+    try:
+        return link_to_xray_outbound(server) is not None
+    except (ValueError, TypeError, IndexError, UnicodeError, KeyError):
+        return False
+
+
+def extract_v2ray_from_text(
+    text: str, *, importable_only: bool = True
+) -> list[V2RayServer]:
     if not text:
         return []
     found: dict[str, V2RayServer] = {}
     for match in _V2RAY_URL_RE.finditer(text):
         server = parse_v2ray_link(match.group("link"))
-        if server:
-            found[server.key] = server
+        if not server:
+            continue
+        if importable_only and not is_importable_v2ray(server):
+            continue
+        found[server.key] = server
     return list(found.values())
 
 
@@ -489,11 +547,23 @@ class V2RayCatalog:
         rows = [
             server.as_db_row()
             for server in servers
-            if server.scheme in self.working and is_nekoray_compatible(server)
+            if server.scheme in self.working and is_importable_v2ray(server)
         ]
         added = self.db.v2ray_upsert_working(rows)
         if added:
             self.enforce_max_working()
+            self.update_subscription()
+        return added
+
+    def add_new(self, servers: Iterable[V2RayServer]) -> int:
+        """Insert unknown servers only; skip max_working trim so Ping V2Ray can explore them."""
+        rows = [
+            server.as_db_row()
+            for server in servers
+            if server.scheme in self.working and is_importable_v2ray(server)
+        ]
+        added = self.db.v2ray_insert_new(rows)
+        if added:
             self.update_subscription()
         return added
 
@@ -555,6 +625,6 @@ def load_v2ray_from_text_file(path: Path) -> list[V2RayServer]:
         if not line or line.startswith("#"):
             continue
         server = parse_v2ray_link(line)
-        if server:
+        if server and is_importable_v2ray(server):
             found[server.key] = server
     return list(found.values())

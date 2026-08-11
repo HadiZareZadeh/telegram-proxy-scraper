@@ -208,6 +208,53 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
         ),
     ),
     (
+        "URL sources",
+        (
+            ConfigField(
+                "url_sources",
+                "enabled",
+                "Enable URL source fetch",
+                "bool",
+                True,
+                hint="Fetch V2Ray lists from urls.txt (GitHub raw, etc.).",
+            ),
+            ConfigField(
+                "url_sources",
+                "urls_file",
+                "URLs file",
+                "str",
+                "urls.txt",
+                hint="One HTTP(S) URL per line.",
+            ),
+            ConfigField(
+                "url_sources",
+                "fetch_interval",
+                "Fetch interval (sec)",
+                "int",
+                3600,
+                minimum=0,
+                hint="0 = fetch once then stop (scraper still re-fetches on each start).",
+            ),
+            ConfigField(
+                "url_sources",
+                "fetch_timeout",
+                "Per-URL timeout (sec)",
+                "float",
+                30.0,
+                minimum=1.0,
+            ),
+            ConfigField(
+                "url_sources",
+                "concurrency",
+                "Parallel downloads",
+                "int",
+                5,
+                minimum=1,
+                maximum=32,
+            ),
+        ),
+    ),
+    (
         "MTProto",
         (
             ConfigField(

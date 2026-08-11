@@ -25,6 +25,11 @@ from fetch_mtproto.v2ray.ping import check_and_reorganize_v2ray
 from fetch_mtproto.prune import probe_kwargs_from_config
 from fetch_mtproto.v2ray.settings import ingest_subscription_kwargs, v2ray_test_kwargs
 from fetch_mtproto.v2ray.store import V2RayCatalog
+from fetch_mtproto.v2ray.url_sources import (
+    ingest_url_sources,
+    periodic_url_source_fetch,
+    url_source_settings,
+)
 
 log = logging.getLogger("mtproto-scraper")
 
@@ -460,6 +465,7 @@ async def run_scraper(config: ModuleType) -> None:
     client, current_proxy = await connect_via_proxy(config, mt_catalog)
     conn_state = ConnectionState(client=client, current_proxy=current_proxy)
     check_task: asyncio.Task | None = None
+    url_fetch_task: asyncio.Task | None = None
     try:
         await ensure_authorized(client)
 
@@ -471,6 +477,10 @@ async def run_scraper(config: ModuleType) -> None:
         limit = getattr(config, "MESSAGES_PER_SOURCE", 500)
         ingest_kwargs = ingest_subscription_kwargs(config)
         reconnect_delay = config_float(getattr(config, "RECONNECT_DELAY", None), 5.0)
+        url_settings = url_source_settings(config)
+        if url_settings.enabled:
+            async with catalog_lock:
+                await ingest_url_sources(v2_catalog, url_settings)
         exclude_keys: set[str] = set()
         mt_new = 0
         v2_new = 0
@@ -537,6 +547,16 @@ async def run_scraper(config: ModuleType) -> None:
             )
             log.info("Proxy / V2Ray re-check scheduled every %.0f seconds", interval)
 
+        if url_settings.enabled and url_settings.fetch_interval > 0:
+            url_fetch_task = asyncio.create_task(
+                periodic_url_source_fetch(v2_catalog, catalog_lock, url_settings)
+            )
+            log.info(
+                "URL source fetch scheduled every %.0f seconds (%s)",
+                url_settings.fetch_interval,
+                url_settings.urls_file.name,
+            )
+
         client = await watch_with_reconnect(
             config,
             client,
@@ -549,11 +569,12 @@ async def run_scraper(config: ModuleType) -> None:
             ingest_kwargs=ingest_kwargs,
         )
     finally:
-        if check_task is not None:
-            check_task.cancel()
-            try:
-                await check_task
-            except asyncio.CancelledError:
-                pass
+        for task in (check_task, url_fetch_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         await client.disconnect()
         db.close()

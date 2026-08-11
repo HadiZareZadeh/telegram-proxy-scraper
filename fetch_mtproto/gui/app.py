@@ -75,6 +75,11 @@ class App:
             "long_running": False,
             "stoppable": True,
         },
+        "fetch_urls": {
+            "label": "URL sources",
+            "module": "fetch_mtproto.cli.fetch_url_sources",
+            "long_running": True,
+        },
         "serve": {
             "label": "Subscription server",
             "module": "fetch_mtproto.cli.update_subscription",
@@ -184,11 +189,12 @@ class App:
         )
         auto_scrape.pack(anchor="w", pady=(0, 12))
 
-        job_keys = ("scrape", "ping_mtproto", "ping_v2ray")
+        job_keys = ("scrape", "ping_mtproto", "ping_v2ray", "fetch_urls")
         job_hints = {
             "scrape": "Collect MTProto / V2Ray proxies from Telegram channels.",
             "ping_mtproto": "Test MTProto servers and update the working catalog.",
             "ping_v2ray": "Test V2Ray servers and update the working catalog.",
+            "fetch_urls": "Fetch V2Ray servers from urls.txt (GitHub raw lists) into the catalog.",
         }
         for key in job_keys:
             spec = self.JOBS[key]

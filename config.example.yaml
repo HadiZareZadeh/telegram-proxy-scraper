@@ -72,6 +72,16 @@ scraper:
   # Pause before reconnecting after a dropped Telegram connection (seconds)
   reconnect_delay: 5
 
+url_sources:
+  # Periodically fetch V2Ray share links from HTTP(S) lists (e.g. GitHub raw files)
+  enabled: true
+  urls_file: urls.txt
+  # Seconds between fetches while scraper / URL-sources job is running (0 = once only)
+  fetch_interval: 3600
+  fetch_timeout: 30.0
+  # Parallel HTTP downloads
+  concurrency: 5
+
 mtproto:
   ping_concurrency: 100
   ping_timeout: 8.0
