@@ -6,11 +6,13 @@ import asyncio
 
 from fetch_mtproto.config_loader import load_config
 from fetch_mtproto.logging_setup import setup_logging
+from fetch_mtproto.mtproto.ping import configure_windows_event_loop
 from fetch_mtproto.scraper.app import run_scraper
 
 
 def main() -> None:
     log = setup_logging()
+    configure_windows_event_loop()
     config = load_config()
     try:
         asyncio.run(run_scraper(config))

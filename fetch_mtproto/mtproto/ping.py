@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import os
 import struct
+import sys
 import time
 from dataclasses import dataclass
 
@@ -417,10 +419,76 @@ async def check_and_reorganize(
     )
 
 
-def patch_telethon_faketls() -> None:
-    """Make TelethonFakeTLS send ChangeCipherSpec before first app-data (required)."""
+def configure_windows_event_loop() -> None:
+    """Use SelectorEventLoop on Windows so closed sockets do not raise WinError 10038."""
+    if sys.platform != "win32":
+        return
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+def normalize_mtproxy_secret(secret: str | bytes) -> bytes:
+    """16-byte MTProxy key, without stripping dd/ee from an already-extracted key.
+
+    Telethon's TcpMTProxy.normalize_secret treats any hex that starts with
+    ``dd``/``ee`` as a prefixed secret. FakeTLS keys are 16 bytes and may
+    themselves start with 0xDD/0xEE, so that strips one extra byte and then
+    raises ``MTProxy secret must be a hex-string representing 16 bytes``.
+    Only strip the prefix when the hex is longer than a 16-byte key.
+    """
+    if isinstance(secret, bytes):
+        if len(secret) >= 17 and secret[0] in (0xEE, 0xDD):
+            secret = secret[1:]
+        return secret[:16]
+
+    if len(secret) > 32 and secret[:2] in ("ee", "dd"):
+        secret = secret[2:]
     try:
-        from TelethonFakeTLS.FakeTLS.TLSInOut import FakeTLSStreamWriter
+        secret_bytes = bytes.fromhex(secret)
+    except ValueError:
+        padded = secret + "=" * (-len(secret) % 4)
+        secret_bytes = base64.b64decode(padded.encode())
+    return secret_bytes[:16]
+
+
+def install_asyncio_exception_handler() -> None:
+    """Swallow leftover Telethon transport errors so GC does not dump them later."""
+    loop = asyncio.get_running_loop()
+    if getattr(loop, "_mtproto_exc_handler", False):
+        return
+    previous = loop.get_exception_handler()
+
+    def handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+        exc = context.get("exception")
+        if isinstance(
+            exc,
+            (
+                asyncio.IncompleteReadError,
+                ConnectionResetError,
+                ConnectionAbortedError,
+                ConnectionRefusedError,
+            ),
+        ):
+            return
+        if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10038:
+            return
+        if previous is not None:
+            previous(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+    loop._mtproto_exc_handler = True  # type: ignore[attr-defined]
+
+
+def patch_telethon_faketls() -> None:
+    """Patch TelethonFakeTLS + Telethon so FakeTLS proxies actually stay up."""
+    _patch_telethon_secret()
+    _patch_telethon_sender()
+    try:
+        from TelethonFakeTLS.FakeTLS.TLSInOut import (
+            FakeTLSStreamReader,
+            FakeTLSStreamWriter,
+        )
     except ImportError:
         return
 
@@ -443,9 +511,81 @@ def patch_telethon_faketls() -> None:
     async def wait_closed(self) -> None:  # type: ignore[no-untyped-def]
         upstream = getattr(self, "upstream", None)
         if upstream is not None and hasattr(upstream, "wait_closed"):
-            await upstream.wait_closed()
+            try:
+                await upstream.wait_closed()
+            except OSError:
+                pass
+
+    def close(self) -> None:  # type: ignore[no-untyped-def]
+        upstream = getattr(self, "upstream", None)
+        if upstream is None:
+            return
+        try:
+            upstream.close()
+        except OSError:
+            pass
+
+    def abort(self) -> None:  # type: ignore[no-untyped-def]
+        upstream = getattr(self, "upstream", None)
+        if upstream is None:
+            return
+        transport = getattr(upstream, "transport", None)
+        if transport is None:
+            return
+        try:
+            transport.abort()
+        except OSError:
+            pass
+
+    async def readexactly(self, n):  # type: ignore[no-untyped-def]
+        while len(self.buf) < n:
+            tls_data = await self.read(1, ignore_buf=True)
+            if not tls_data:
+                partial = bytes(self.buf)
+                self.buf = bytearray()
+                raise asyncio.IncompleteReadError(partial, n)
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return bytes(data)
 
     write._mtproto_ccs_patched = True  # type: ignore[attr-defined]
     FakeTLSStreamWriter.write = write  # type: ignore[method-assign]
+    FakeTLSStreamWriter.close = close  # type: ignore[method-assign]
+    FakeTLSStreamWriter.abort = abort  # type: ignore[method-assign]
+    FakeTLSStreamReader.readexactly = readexactly  # type: ignore[method-assign]
     if not hasattr(FakeTLSStreamWriter, "wait_closed"):
         FakeTLSStreamWriter.wait_closed = wait_closed  # type: ignore[attr-defined]
+
+
+def _patch_telethon_secret() -> None:
+    try:
+        from telethon.network.connection.tcpmtproxy import TcpMTProxy
+    except ImportError:
+        return
+    if getattr(TcpMTProxy.normalize_secret, "_mtproto_secret_patched", False):
+        return
+    normalize_mtproxy_secret._mtproto_secret_patched = True  # type: ignore[attr-defined]
+    TcpMTProxy.normalize_secret = staticmethod(normalize_mtproxy_secret)  # type: ignore[method-assign]
+
+
+def _patch_telethon_sender() -> None:
+    """Skip Telethon's 0-retry reconnect task (it only leaves unretrieved futures)."""
+    try:
+        from telethon import helpers
+        from telethon.network.mtprotosender import MTProtoSender
+    except ImportError:
+        return
+    if getattr(MTProtoSender._start_reconnect, "_mtproto_reconnect_patched", False):
+        return
+
+    def _start_reconnect(self, error):  # type: ignore[no-untyped-def]
+        if not self._user_connected or self._reconnecting:
+            return
+        self._reconnecting = True
+        loop = helpers.get_running_loop()
+        if self._auto_reconnect:
+            loop.create_task(self._reconnect(error))
+            return
+        loop.create_task(self._disconnect(error=error))
+
+    _start_reconnect._mtproto_reconnect_patched = True  # type: ignore[attr-defined]
+    MTProtoSender._start_reconnect = _start_reconnect  # type: ignore[method-assign]

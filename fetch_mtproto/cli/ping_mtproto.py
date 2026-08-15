@@ -8,7 +8,11 @@ import sys
 from fetch_mtproto.cancel import CancelScope
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import load_config
-from fetch_mtproto.mtproto.ping import check_and_reorganize, patch_telethon_faketls
+from fetch_mtproto.mtproto.ping import (
+    check_and_reorganize,
+    configure_windows_event_loop,
+    patch_telethon_faketls,
+)
 from fetch_mtproto.prune import probe_kwargs_from_config
 
 
@@ -97,6 +101,7 @@ def main() -> None:
     from fetch_mtproto.logging_setup import setup_logging
 
     setup_logging()
+    configure_windows_event_loop()
     patch_telethon_faketls()
     config = load_config()
     best: list = [None]

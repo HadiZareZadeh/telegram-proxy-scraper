@@ -13,11 +13,17 @@ from telethon.tl.custom.message import Message
 
 from fetch_mtproto.catalogs import open_catalogs
 from fetch_mtproto.config_loader import config_float
-from fetch_mtproto.mtproto.ping import PingResult, check_and_reorganize, patch_telethon_faketls
+from fetch_mtproto.mtproto.ping import (
+    PingResult,
+    check_and_reorganize,
+    install_asyncio_exception_handler,
+    patch_telethon_faketls,
+)
 from fetch_mtproto.mtproto.store import MTProtoProxy, ProxyCatalog
 from fetch_mtproto.scraper.client import (
     connect_via_proxy,
     fastest_working_proxy,
+    safe_disconnect,
     switch_to_proxy,
 )
 from fetch_mtproto.scraper.ingest import ingest_message
@@ -67,10 +73,7 @@ async def _request_fastest_proxy_switch(
         client = conn_state.client
 
     if client is not None and client.is_connected():
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await safe_disconnect(client)
 
 
 async def scrape_source(
@@ -196,10 +199,7 @@ async def _reconnect_after_drop(
             )
         log.info("Marked proxy as failed: %s", current_proxy.to_link())
 
-    try:
-        await client.disconnect()
-    except Exception:
-        pass
+    await safe_disconnect(client)
 
     while True:
         try:
@@ -269,10 +269,7 @@ async def watch_with_reconnect(
                     exc,
                 )
                 exclude_keys.add(pending.key)
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
+                await safe_disconnect(client)
                 client, current_proxy = await connect_via_proxy(
                     config, mt_catalog, exclude_keys=exclude_keys
                 )
@@ -287,10 +284,7 @@ async def watch_with_reconnect(
                 "No watchable sources after proxy switch — retrying in %.0f seconds",
                 delay,
             )
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await safe_disconnect(client)
             await asyncio.sleep(delay)
             continue
 
@@ -314,10 +308,7 @@ async def watch_with_reconnect(
                 "No watchable sources after reconnect — retrying in %.0f seconds",
                 delay,
             )
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+            await safe_disconnect(client)
             await asyncio.sleep(delay)
 
 
@@ -444,6 +435,7 @@ async def ensure_authorized(client: TelegramClient) -> None:
 
 
 async def run_scraper(config: ModuleType) -> None:
+    install_asyncio_exception_handler()
     patch_telethon_faketls()
     db, mt_catalog, v2_catalog = open_catalogs(config)
     catalog_lock = asyncio.Lock()
@@ -576,5 +568,5 @@ async def run_scraper(config: ModuleType) -> None:
                     await task
                 except asyncio.CancelledError:
                     pass
-        await client.disconnect()
+        await safe_disconnect(client)
         db.close()

@@ -57,10 +57,15 @@ class MTProtoProxy:
         )
 
     def as_telethon_tuple(self) -> tuple[str, int, str]:
-        """Tuple for stock Telethon (dd / plain) or TelethonFakeTLS (ee without prefix)."""
+        """Tuple for stock Telethon (dd / plain) or TelethonFakeTLS (ee without prefix).
+
+        TelethonFakeTLS prepends ``ee`` itself. The remaining hex may still start
+        with ``dd``/``ee`` (those bytes are part of the 16-byte key); Telethon's
+        secret parser is patched in ping.patch_telethon_faketls so it does not
+        strip them again.
+        """
         secret = self.secret
         if self.is_fake_tls:
-            # TelethonFakeTLS expects hex without the leading "ee"
             secret = secret[2:]
         return (self.server, self.port, secret)
 

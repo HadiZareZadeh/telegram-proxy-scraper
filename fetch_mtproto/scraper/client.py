@@ -11,7 +11,7 @@ from telethon.errors import AuthKeyDuplicatedError
 from telethon.tl.functions.help import GetConfigRequest
 
 from fetch_mtproto.config_loader import config_float, resolve_max_working
-from fetch_mtproto.mtproto.ping import find_first_working_proxy
+from fetch_mtproto.mtproto.ping import PingResult, find_first_working_proxy
 from fetch_mtproto.mtproto.store import MTProtoProxy, ProxyCatalog
 from fetch_mtproto.paths import session_path
 
@@ -67,22 +67,52 @@ async def _probe_telegram(client: TelegramClient, timeout: float) -> None:
     await asyncio.wait_for(client(GetConfigRequest()), timeout=timeout)
 
 
+def _retrieve_future_exception(fut: object) -> None:
+    if not isinstance(fut, asyncio.Future) or not fut.done() or fut.cancelled():
+        return
+    fut.exception()
+
+
+def _drain_telethon_exceptions(client: TelegramClient) -> None:
+    """Mark Telethon disconnect/RPC errors retrieved so asyncio GC stays quiet."""
+    sender = getattr(client, "_sender", None)
+    if sender is None:
+        return
+    _retrieve_future_exception(getattr(sender, "_disconnected", None))
+    _retrieve_future_exception(getattr(sender, "_MTProtoSender__disconnected", None))
+    pending = getattr(sender, "_pending_state", None)
+    if isinstance(pending, dict):
+        for state in list(pending.values()):
+            _retrieve_future_exception(getattr(state, "future", None))
+
+
+async def safe_disconnect(client: TelegramClient | None) -> None:
+    if client is None:
+        return
+    await asyncio.sleep(0)
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    _drain_telethon_exceptions(client)
+    await asyncio.sleep(0)
+    _drain_telethon_exceptions(client)
+
+
 async def try_connect(
     client: TelegramClient, label: str, *, timeout: float
 ) -> tuple[bool, BaseException | None]:
     try:
         await client.connect()
         if not client.is_connected():
+            await safe_disconnect(client)
             return False, None
         await _probe_telegram(client, timeout)
         log.info("Connected via %s", label)
         return True, None
     except Exception as exc:
         log.warning("Connect via %s failed: %s", label, exc)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await safe_disconnect(client)
         return False, exc
 
 
@@ -141,10 +171,7 @@ async def switch_to_proxy(
     """Disconnect the old client and connect via a specific proxy."""
     timeout = config_float(getattr(config, "PING_TIMEOUT", None), 8.0)
     if old_client is not None:
-        try:
-            await old_client.disconnect()
-        except Exception:
-            pass
+        await safe_disconnect(old_client)
 
     log.info("Switching to fastest proxy: %s", proxy.to_link())
     client = make_client(config, config.SESSION_NAME, proxy=proxy)
@@ -228,6 +255,15 @@ async def connect_via_proxy(
                 f"Delete sessions/{config.SESSION_NAME}.session and log in again."
             ) from err
 
+        catalog.apply_ping_results(
+            [
+                PingResult(
+                    proxy=proxy,
+                    latency=None,
+                    error=str(err) if err else "telethon connect failed",
+                )
+            ]
+        )
         log.warning("Proxy failed to connect — trying next candidate.")
         skip.add(proxy.key)
         candidates = _proxy_candidates(catalog, config, skip)
