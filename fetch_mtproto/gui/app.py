@@ -1212,6 +1212,43 @@ class App:
             self._schedule_proxy_pool_restart()
             return
 
+        # UI can lag behind config.yaml (or still hold 0 after a yaml edit). Honor both
+        # diversity_rotate_sec and legacy switch_interval_sec from disk before save.
+        config_for_rotate = load_config(required=False)
+        if config_for_rotate is not None:
+            file_diversity = max(
+                0,
+                int(
+                    getattr(config_for_rotate, "PROXY_POOL_DIVERSITY_ROTATE_SEC", 0)
+                    or 0
+                ),
+            )
+            file_switch = max(
+                0,
+                int(
+                    getattr(config_for_rotate, "PROXY_POOL_SWITCH_INTERVAL_SEC", 0) or 0
+                ),
+            )
+            diversity = max(diversity, file_diversity, file_switch)
+        try:
+            self.settings.var("proxy_pool", "diversity_rotate_sec").set(int(diversity))
+        except (tk.TclError, KeyError):
+            pass
+        # Keep legacy switch_interval_sec aligned so a later save cannot resurrect a stale value.
+        try:
+            from fetch_mtproto.config_loader import update_config_values
+
+            update_config_values(
+                {
+                    "proxy_pool": {
+                        "diversity_rotate_sec": int(diversity),
+                        "switch_interval_sec": int(diversity),
+                    }
+                }
+            )
+        except OSError as exc:
+            self.log_line(f"[config] failed to sync rotate interval: {exc}")
+
         last_socks, last_http = last_pool_ports(start_port, http_start, count)
         if last_socks > 65535 or last_http > 65535:
             msg = (
@@ -1273,10 +1310,13 @@ class App:
         self.settings.set_pool_inputs_enabled(False)
         mode = "random" if random_pick else "fastest-first"
         verb = "re-starting" if is_restart else "starting"
+        rotate_note = (
+            f", rotate every {diversity}s" if diversity > 0 else ", timed rotate off"
+        )
         self.log_line(
             f"[proxy pool] {verb} {count} slot(s): SOCKS {start_port}–{last_socks}, "
             f"HTTP {http_start}–{last_http}, api {api_port} "
-            f"({mode} ≤{max_latency_ms} ms, routing-only rotate)"
+            f"({mode} ≤{max_latency_ms} ms, routing-only rotate{rotate_note})"
         )
         if not is_restart:
             self.notebook.select(self.proxy_pool_tab)

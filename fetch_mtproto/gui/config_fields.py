@@ -423,7 +423,7 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
                 0,
                 minimum=0,
                 maximum=86400,
-                hint="0 = off. Event-driven repair is automatic; use Rotate all for a full shuffle.",
+                hint="0 = off. Full slot reassignment on this interval (and on Rotate all).",
             ),
             ConfigField(
                 "proxy_pool",

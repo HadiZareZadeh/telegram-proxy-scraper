@@ -156,7 +156,10 @@ class ProxyPoolRunner:
         self.reserve_outbounds = max(0, int(reserve_outbounds))
         self.hot_refresh_sec = max(2.0, float(hot_refresh_sec))
         self.freshness_sec = max(60.0, float(freshness_sec))
-        self.diversity_rotate_sec = max(0.0, float(diversity_rotate_sec))
+        # Either knob enables timed rotate-all (legacy switch_interval_sec still honored).
+        self.diversity_rotate_sec = max(
+            0.0, float(diversity_rotate_sec), float(switch_interval_sec)
+        )
         del reuse_after_rotations
         self._log = log or (lambda _msg: None)
         self._on_status = on_status
@@ -326,11 +329,17 @@ class ProxyPoolRunner:
         self._handler = HandlerClient(self._control)
         self._routing = RoutingClient(self._control)
         self._stats = StatsClient(self._control)
+        rotate_sec = self.diversity_rotate_sec
+        rotate_note = (
+            f", diversity rotate every {rotate_sec:.0f}s"
+            if rotate_sec > 0
+            else ", diversity rotate off"
+        )
         self._log(
             f"[proxy pool] xray ready: {self.count} SOCKS "
             f"{self.start_port}–{self.start_port + self.count - 1}, "
             f"HTTP {self.http_start_port}–{self.http_start_port + self.count - 1}, "
-            f"api {self.api_port} (no restart on rotate)"
+            f"api {self.api_port} (no restart on rotate{rotate_note})"
         )
 
         last_hot = 0.0
@@ -343,12 +352,13 @@ class ProxyPoolRunner:
             if self._rotate_all_event.is_set():
                 self._rotate_all_event.clear()
                 await self._rotate_all()
+                last_diversity = time.monotonic()
             if (
                 self.diversity_rotate_sec > 0
                 and now - last_diversity >= self.diversity_rotate_sec
             ):
                 await self._rotate_all()
-                last_diversity = now
+                last_diversity = time.monotonic()
             await self._refresh_traffic()
             self._emit_status()
             await asyncio.sleep(TRAFFIC_POLL_SEC)
@@ -575,15 +585,15 @@ class ProxyPoolRunner:
     async def _rotate_all(self) -> None:
         rows, servers = self._catalog_rows()
         if not servers:
+            self._log("[proxy pool] rotate-all skipped — no eligible servers")
             return
-        now = time.monotonic()
-        cooling = {key for key in servers if self._is_cooling(key, now=now)}
+        # Timed/manual shuffle should reassign freely; reuse cooldown is for repair only.
+        self._leases.clear()
         hot = select_hot_set(
             rows,
             active=self.count,
             standby=self.standby_outbounds,
             reserve=self.reserve_outbounds,
-            cooling=cooling,
         )
         await self._sync_loaded_outbounds(hot.all_keys, servers)
         await self._assign_keys(hot.all_keys, servers, replace_all=True)
