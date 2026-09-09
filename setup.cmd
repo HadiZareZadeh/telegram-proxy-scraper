@@ -111,7 +111,7 @@ if not exist "!PYTHONW!" set "PYTHONW=%PYTHON%"
 goto :eof
 
 :deps_satisfied
-"%PYTHON%" -c "import telethon, python_socks, TelethonFakeTLS, cryptography" >nul 2>&1
+"%PYTHON%" -c "import telethon, python_socks, TelethonFakeTLS, cryptography, grpc" >nul 2>&1
 goto :eof
 
 :find_xray_on_path
@@ -217,7 +217,8 @@ if defined XRAY_ON_PATH (
   if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "XRAY_ASSET=Xray-windows-arm64-v8a.zip"
   if /i "%PROCESSOR_ARCHITEW6432%"=="ARM64" set "XRAY_ASSET=Xray-windows-arm64-v8a.zip"
 
-  set "XRAY_URL=https://github.com/XTLS/Xray-core/releases/latest/download/!XRAY_ASSET!"
+  set "XRAY_PIN=v26.3.27"
+  set "XRAY_URL=https://github.com/XTLS/Xray-core/releases/download/!XRAY_PIN!/!XRAY_ASSET!"
   echo   URL: !XRAY_URL!
   curl.exe -L --retry 3 --fail -o "%TMP_DIR%\!XRAY_ASSET!" "!XRAY_URL!"
   if errorlevel 1 (

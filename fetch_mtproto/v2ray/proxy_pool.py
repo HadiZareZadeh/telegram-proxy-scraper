@@ -1,7 +1,8 @@
-"""Run persistent local SOCKS5 + HTTP proxies backed by catalog V2Ray servers."""
+"""Persistent local SOCKS5+HTTP slots: hot ring + routing-only rotation."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -9,58 +10,59 @@ import socket
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable
 
 from fetch_mtproto.catalogs import open_catalogs
-from fetch_mtproto.config_loader import load_config
-from fetch_mtproto.health import hours_since
+from fetch_mtproto.config_loader import config_bool, config_float, config_int, load_config
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_process_tree
-from fetch_mtproto.v2ray.ping import (
-    DEFAULT_TEST_TIMEOUT,
-    DEFAULT_TEST_URL,
-    resolve_xray_bin,
+from fetch_mtproto.v2ray.hot_set import select_hot_set, spread_keys
+from fetch_mtproto.v2ray.ping import resolve_xray_bin
+from fetch_mtproto.v2ray.pool_ports import (
+    DEFAULT_HTTP_START_PORT,
+    DEFAULT_POOL_API_PORT,
+    DEFAULT_POOL_COUNT,
+    DEFAULT_SOCKS_START_PORT,
+    balancer_tag,
+    clamp_pool_count,
+    fallback_outbound_tag,
+    last_pool_ports,
+    node_outbound_tag,
+    slot_ports,
 )
-from fetch_mtproto.v2ray.port_cleanup import (
-    DEFAULT_POOL_TEST_BASE_PORT,
-    cleanup_pool_xray,
-    pool_test_ports,
-)
+from fetch_mtproto.v2ray.port_cleanup import cleanup_pool_xray
 from fetch_mtproto.v2ray.store import V2RayServer, _server_from_row, is_nekoray_compatible
+from fetch_mtproto.v2ray.win_ports import (
+    colliding_ports,
+    fatal_bind_issues,
+    format_port_diagnostics,
+    query_dynamic_tcp_ports,
+    query_excluded_tcp_ranges,
+    unbindable_localhost_ports,
+)
 from fetch_mtproto.v2ray.xray import (
-    XRAY_SCHEMES,
-    build_xray_multi_pool_config,
+    blackhole_json,
+    build_xray_slot_balancer_config,
     format_traffic_bytes,
     link_to_xray_outbound,
 )
-from fetch_mtproto.v2ray.xray_session import (
-    XrayLiveSession,
-    pool_test_api_port,
-    pool_test_live_slot,
+from fetch_mtproto.v2ray.xray_control import (
+    HandlerClient,
+    RoutingClient,
+    StatsClient,
+    XrayControlChannel,
 )
+from fetch_mtproto.v2ray.xray_version import xray_version_warning
 
 LogFn = Callable[[str], None]
 StatusFn = Callable[[list["ProxySlotStatus"]], None]
+SnapshotFn = Callable[["PoolSnapshot"], None]
 FinishedFn = Callable[[], None]
-SlotStartResult = Literal["ok", "failed", "slow"]
 
-PORTS_PER_SLOT = 2
-# Stats API port offset from pool start_port (one API for the shared pool process).
-API_PORT_OFFSET = 10000
 TRAFFIC_POLL_SEC = 2.0
-# How many upstream candidates to try per slot before giving up.
-MAX_VALIDATE_ATTEMPTS_PER_SLOT = 16
-# Wait when the catalog has no servers before retrying.
-EMPTY_CATALOG_WAIT_SEC = 60.0
-# Defaults; overridden by config.yaml proxy_pool.* when the runner is started.
-DEFAULT_REUSE_AFTER_ROTATIONS = 5
-DEFAULT_REUSE_AFTER_SEC = 20 * 60
-DEFAULT_MAX_LATENCY_MS = 2000
-# Trust catalog latency for pre-tested servers checked within this window (hours).
-TRUST_CATALOG_MAX_AGE_H = 0.5
+EMPTY_CATALOG_WAIT_SEC = 30.0
+TRUST_FRESHNESS_SEC = 900.0
 
 
 @dataclass(slots=True)
@@ -74,6 +76,8 @@ class ProxySlotStatus:
     error: str | None = None
     upload_bytes: int = 0
     download_bytes: int = 0
+    node_key: str | None = None
+    ring: str = ""
 
     @property
     def upload_text(self) -> str:
@@ -84,86 +88,98 @@ class ProxySlotStatus:
         return format_traffic_bytes(self.download_bytes)
 
 
+@dataclass(slots=True)
+class PoolSnapshot:
+    total: int
+    healthy: int
+    degraded: int
+    dead: int
+    average_latency: float | None
+    slots: list[ProxySlotStatus] = field(default_factory=list)
+
+
 @dataclass
 class _ProxySlot:
     socks_port: int
     http_port: int
     server: V2RayServer | None = None
     error: str | None = None
-    # Lifetime totals for this pool session (survive upstream rotations).
     base_upload: int = 0
     base_download: int = 0
     upload_bytes: int = 0
     download_bytes: int = 0
+    outbound_tag: str | None = None
 
 
 @dataclass(slots=True)
-class _UsageRecord:
-    rotation: int
+class _Lease:
+    slot: int
     used_at: float
 
 
 class ProxyPoolRunner:
-    """Manage N local proxy slots via two Xray processes (pool + validation)."""
+    """One never-restarted pool Xray; rotate by OverrideBalancerTarget only."""
 
     def __init__(
         self,
         *,
         start_port: int,
         count: int,
-        switch_interval_sec: float,
+        switch_interval_sec: float = 0.0,
         xray_bin: str | None = None,
-        reuse_after_rotations: int = DEFAULT_REUSE_AFTER_ROTATIONS,
-        reuse_after_sec: float = DEFAULT_REUSE_AFTER_SEC,
-        max_latency_ms: float = DEFAULT_MAX_LATENCY_MS,
+        reuse_after_rotations: int = 1,
+        reuse_after_sec: float = 600.0,
+        max_latency_ms: float = 3000.0,
         random_pick: bool = True,
-        test_base_port: int = DEFAULT_POOL_TEST_BASE_PORT,
+        http_start_port: int | None = None,
+        api_port: int | None = None,
+        standby_outbounds: int = 300,
+        reserve_outbounds: int = 100,
+        hot_refresh_sec: float = 10.0,
+        freshness_sec: float = TRUST_FRESHNESS_SEC,
+        diversity_rotate_sec: float = 0.0,
         log: LogFn | None = None,
         on_status: StatusFn | None = None,
+        on_snapshot: SnapshotFn | None = None,
         on_finished: FinishedFn | None = None,
     ) -> None:
-        self.start_port = start_port
-        self.count = count
-        self.switch_interval_sec = switch_interval_sec
+        self.start_port = int(start_port)
+        self.http_start_port = int(http_start_port or DEFAULT_HTTP_START_PORT)
+        self.count = clamp_pool_count(count)
+        self.switch_interval_sec = float(switch_interval_sec)
         self.xray_bin = xray_bin
-        self.reuse_after_rotations = max(1, int(reuse_after_rotations))
-        self.reuse_after_sec = max(1.0, float(reuse_after_sec))
+        self.min_reuse_sec = max(1.0, float(reuse_after_sec))
         self.max_latency_ms = max(1.0, float(max_latency_ms))
         self.random_pick = bool(random_pick)
-        self.test_base_port = int(test_base_port)
+        self.api_port = int(api_port or DEFAULT_POOL_API_PORT)
+        self.standby_outbounds = max(0, int(standby_outbounds))
+        self.reserve_outbounds = max(0, int(reserve_outbounds))
+        self.hot_refresh_sec = max(2.0, float(hot_refresh_sec))
+        self.freshness_sec = max(60.0, float(freshness_sec))
+        self.diversity_rotate_sec = max(0.0, float(diversity_rotate_sec))
+        del reuse_after_rotations
         self._log = log or (lambda _msg: None)
         self._on_status = on_status
+        self._on_snapshot = on_snapshot
         self._on_finished = on_finished
-        self._latency_by_key: dict[str, float] = {}
-        self._checked_at_by_key: dict[str, str] = {}
 
         self._thread: threading.Thread | None = None
-        self._traffic_thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = threading.Event()
         self._slots_lock = threading.Lock()
-        self._assigning_slots = False
         self._slots: list[_ProxySlot] = []
-        self._servers: list[V2RayServer] = []
-        self._recovery_servers: list[V2RayServer] = []
-        self._rotation_round = 0
+        self._leases: dict[str, _Lease] = {}
+        self._loaded_tags: set[str] = set()
+        self._generation = 0
         self._bin_path: str | None = None
-        # key -> last use (rotation index + wall clock)
-        self._usage: dict[str, _UsageRecord] = {}
-        # Keys assigned on the previous (still-running) round.
-        self._previous_keys: list[str] = []
-        self._current_keys: list[str] = []
-
-        # Shared pool process (all 10801+ slots) + long-lived validation session.
         self._pool_process: subprocess.Popen | None = None
         self._pool_cfg_path: Path | None = None
-        self._api_port = self.start_port + API_PORT_OFFSET
-        self._test_session: XrayLiveSession | None = None
-        test_ports = pool_test_ports(self.test_base_port)
-        self._test_socks_port = test_ports[0]
-        self._test_http_port = test_ports[1]
-        self._test_api_port = test_ports[2] if len(test_ports) > 2 else pool_test_api_port(
-            self.test_base_port
-        )
+        self._control: XrayControlChannel | None = None
+        self._handler: HandlerClient | None = None
+        self._routing: RoutingClient | None = None
+        self._stats: StatsClient | None = None
+        self._latency_by_key: dict[str, float] = {}
+        self._rotate_all_event = threading.Event()
 
     @property
     def running(self) -> bool:
@@ -173,117 +189,51 @@ class ProxyPoolRunner:
         return self._pool_process is not None and self._pool_process.poll() is None
 
     @staticmethod
-    def ports_for_slot(start_port: int, slot_index: int) -> tuple[int, int]:
-        base = start_port + slot_index * PORTS_PER_SLOT
-        return base, base + 1
+    def ports_for_slot(
+        start_port: int, slot_index: int, http_start: int | None = None
+    ) -> tuple[int, int]:
+        return slot_ports(
+            start_port, http_start or DEFAULT_HTTP_START_PORT, slot_index
+        )
 
     @staticmethod
     def api_port_for_start(start_port: int) -> int:
-        return start_port + API_PORT_OFFSET
+        del start_port
+        return DEFAULT_POOL_API_PORT
 
     @staticmethod
-    def last_port(start_port: int, count: int) -> int:
-        if count <= 0:
-            return start_port
-        _socks, http = ProxyPoolRunner.ports_for_slot(start_port, count - 1)
+    def last_port(start_port: int, count: int, http_start: int | None = None) -> int:
+        _socks, http = last_pool_ports(
+            start_port, http_start or DEFAULT_HTTP_START_PORT, count
+        )
         return http
 
     def start(self) -> None:
         if self.running:
             return
         self._stop_event.clear()
+        self._rotate_all_event.clear()
         self._thread = threading.Thread(target=self._run, name="proxy-pool", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        """Signal stop and kill Xray processes immediately (non-blocking-friendly)."""
         self._stop_event.set()
-        # Kill now so port waits abort and the worker can exit quickly.
-        self._kill_all_processes()
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(lambda: None)
+        self._kill_process()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
+            thread.join(timeout=3.0)
             if not thread.is_alive():
                 self._thread = None
 
+    def request_rotate_all(self) -> None:
+        self._rotate_all_event.set()
+
     def _run(self) -> None:
         try:
-            self._bin_path = resolve_xray_bin(self.xray_bin)
-            if not self._bin_path:
-                self._log(
-                    "[proxy pool] xray binary not found — run setup or set xray.bin in config.yaml"
-                )
-                return
-
-            killed = cleanup_pool_xray(start_port=self.start_port, count=self.count)
-            if killed:
-                self._log(
-                    f"[proxy pool] cleared {len(killed)} leftover xray process(es) "
-                    f"on pool ports {self.start_port}+"
-                )
-
-            self._api_port = self.api_port_for_start(self.start_port)
-            with self._slots_lock:
-                self._slots = []
-                for index in range(self.count):
-                    socks_port, http_port = self.ports_for_slot(self.start_port, index)
-                    self._slots.append(
-                        _ProxySlot(socks_port=socks_port, http_port=http_port)
-                    )
-            self._rotation_round = 0
-            self._usage.clear()
-            self._previous_keys = []
-            self._current_keys = []
-            if not self._ensure_test_session():
-                self._log(
-                    "[proxy pool] continuing without a pre-started test xray "
-                    "(will retry when validating candidates)"
-                )
-
-            while not self._stop_event.is_set():
-                self._refresh_servers()
-                if not self._servers and not self._recovery_servers:
-                    self._log(
-                        "[proxy pool] no V2Ray servers in catalog — "
-                        f"retrying in {int(EMPTY_CATALOG_WAIT_SEC)}s"
-                    )
-                    if self._stop_event.wait(EMPTY_CATALOG_WAIT_SEC):
-                        return
-                    continue
-
-                if self._rotation_round == 0:
-                    if not self._servers:
-                        self._log(
-                            f"[proxy pool] no pre-tested servers ≤ "
-                            f"{self.max_latency_ms:.0f} ms — live-testing catalog"
-                        )
-                    elif len(self._servers) < self.count:
-                        self._log(
-                            f"[proxy pool] only {len(self._servers)} tested server(s) ≤ "
-                            f"{self.max_latency_ms:.0f} ms for {self.count} slot(s); "
-                            "will probe more from catalog when needed"
-                        )
-
-                self._start_all_slots(initial=self._rotation_round == 0)
-                if self._stop_event.is_set():
-                    return
-                self._emit_status()
-
-                if self._traffic_thread is None or not self._traffic_thread.is_alive():
-                    self._traffic_thread = threading.Thread(
-                        target=self._traffic_loop,
-                        name="proxy-pool-traffic",
-                        daemon=True,
-                    )
-                    self._traffic_thread.start()
-
-                if self._stop_event.wait(self.switch_interval_sec):
-                    return
-                self._rotation_round += 1
-                self._log(
-                    f"[proxy pool] rotating upstream servers (round {self._rotation_round})"
-                )
-
+            asyncio.run(self._async_run())
         finally:
             self._cleanup_all()
             self._emit_status()
@@ -291,817 +241,417 @@ class ProxyPoolRunner:
             if self._on_finished is not None:
                 self._on_finished()
 
-    def _refresh_servers(self) -> None:
-        self._servers, primary_latency, primary_checked = self._load_primary_servers()
-        self._recovery_servers, recovery_latency, recovery_checked = (
-            self._load_recovery_servers()
+    async def _async_run(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._bin_path = resolve_xray_bin(self.xray_bin)
+        if not self._bin_path:
+            self._log(
+                "[proxy pool] xray binary not found — run setup or set xray.bin in config.yaml"
+            )
+            return
+
+        warning = xray_version_warning(self._bin_path)
+        if warning:
+            self._log(f"[proxy pool] {warning}")
+
+        killed = cleanup_pool_xray(
+            start_port=self.start_port,
+            count=self.count,
+            http_start=self.http_start_port,
+            api_port=self.api_port,
         )
-        self._latency_by_key = {**recovery_latency, **primary_latency}
-        self._checked_at_by_key = {**recovery_checked, **primary_checked}
+        if killed:
+            self._log(
+                f"[proxy pool] cleared {len(killed)} leftover xray process(es) "
+                f"on SOCKS {self.start_port}+ / HTTP {self.http_start_port}+"
+            )
 
-    def _trust_catalog_latency(
-        self, server: V2RayServer, *, allow_slow: bool, initial: bool
-    ) -> bool:
-        """Skip a live HTTP probe when Ping V2Ray recently verified this server."""
-        if initial or allow_slow:
-            return False
-        lat = self._latency_by_key.get(server.key)
-        if lat is None or lat > self.max_latency_ms:
-            return False
-        checked = self._checked_at_by_key.get(server.key)
-        if not checked:
-            return False
-        return hours_since(checked) <= TRUST_CATALOG_MAX_AGE_H
+        ports = []
+        with self._slots_lock:
+            self._slots = []
+            for index in range(self.count):
+                socks, http = slot_ports(self.start_port, self.http_start_port, index)
+                ports.extend((socks, http))
+                self._slots.append(_ProxySlot(socks_port=socks, http_port=http))
+        ports.append(self.api_port)
+        dynamic = query_dynamic_tcp_ports()
+        excluded = query_excluded_tcp_ranges()
+        diag = format_port_diagnostics(dynamic=dynamic, excluded=excluded)
+        if diag:
+            self._log(f"[proxy pool] Windows ports: {diag}")
+        issues = colliding_ports(ports, dynamic=dynamic, excluded=excluded)
+        for issue in issues:
+            self._log(f"[proxy pool] port check: {issue}")
+        fatal = fatal_bind_issues(issues)
+        if fatal:
+            self._log(
+                "[proxy pool] refusing to bind — change SOCKS/HTTP/API ports in Settings"
+            )
+            return
+        blocked = unbindable_localhost_ports(ports)
+        if blocked:
+            sample = ", ".join(str(p) for p in blocked[:8])
+            extra = f" (+{len(blocked) - 8} more)" if len(blocked) > 8 else ""
+            self._log(
+                f"[proxy pool] cannot bind {len(blocked)} port(s) on 127.0.0.1 "
+                f"({sample}{extra}) — pick SOCKS/HTTP ranges outside the "
+                f"Windows dynamic TCP pool"
+            )
+            return
 
-    def _filter_compatible_rows(
-        self, rows: list
-    ) -> tuple[list[V2RayServer], dict[str, float], dict[str, str]]:
-        servers: list[V2RayServer] = []
-        latency_by_key: dict[str, float] = {}
-        checked_at_by_key: dict[str, str] = {}
+        config = build_xray_slot_balancer_config(
+            slot_count=self.count,
+            socks_start=self.start_port,
+            http_start=self.http_start_port,
+            api_port=self.api_port,
+            hot_outbounds=[],
+            fallback=blackhole_json(fallback_outbound_tag()),
+        )
+        try:
+            self._pool_process, self._pool_cfg_path = self._start_xray(config)
+        except OSError as exc:
+            self._log(f"[proxy pool] xray start failed: {exc}")
+            return
+
+        if not await self._wait_port("127.0.0.1", self.api_port, timeout=15.0):
+            self._log("[proxy pool] API port did not open")
+            return
+        for slot in self._slots:
+            if self._stop_event.is_set():
+                return
+            await self._wait_port("127.0.0.1", slot.socks_port, timeout=8.0)
+
+        self._control = XrayControlChannel(port=self.api_port)
+        await self._control.connect()
+        self._handler = HandlerClient(self._control)
+        self._routing = RoutingClient(self._control)
+        self._stats = StatsClient(self._control)
+        self._log(
+            f"[proxy pool] xray ready: {self.count} SOCKS "
+            f"{self.start_port}–{self.start_port + self.count - 1}, "
+            f"HTTP {self.http_start_port}–{self.http_start_port + self.count - 1}, "
+            f"api {self.api_port} (no restart on rotate)"
+        )
+
+        last_hot = 0.0
+        last_diversity = time.monotonic()
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            if now - last_hot >= self.hot_refresh_sec or last_hot == 0.0:
+                await self._refresh_hot_and_assign(initial=last_hot == 0.0)
+                last_hot = now
+            if self._rotate_all_event.is_set():
+                self._rotate_all_event.clear()
+                await self._rotate_all()
+            if (
+                self.diversity_rotate_sec > 0
+                and now - last_diversity >= self.diversity_rotate_sec
+            ):
+                await self._rotate_all()
+                last_diversity = now
+            await self._refresh_traffic()
+            self._emit_status()
+            await asyncio.sleep(TRAFFIC_POLL_SEC)
+
+    def _catalog_rows(self):
+        config = load_config(required=False)
+        db, _mt, _v2 = open_catalogs(config)
+        rows = db.v2ray_hot_candidates(
+            max_latency_ms=self.max_latency_ms,
+            freshness_sec=self.freshness_sec,
+        )
+        # Freshly probed-but-not-yet-verified healthy rows: allow catalog latency.
+        if not rows:
+            rows = db.conn.execute(
+                """
+                SELECT * FROM v2ray
+                WHERE state IN ('healthy', 'degraded', 'unknown')
+                  AND last_latency_ms IS NOT NULL
+                  AND last_latency_ms <= ?
+                ORDER BY last_latency_ms ASC
+                LIMIT 2000
+                """,
+                (self.max_latency_ms,),
+            ).fetchall()
+        servers: dict[str, V2RayServer] = {}
         for row in rows:
             server = _server_from_row(row)
-            if server.scheme not in XRAY_SCHEMES:
+            if server.scheme not in {"vmess", "vless", "trojan", "ss"}:
                 continue
             if not is_nekoray_compatible(server):
                 continue
             if link_to_xray_outbound(server) is None:
                 continue
-            servers.append(server)
+            servers[server.key] = server
             lat = row["last_latency_ms"]
             if lat is not None:
-                latency_by_key[server.key] = float(lat)
-            checked = row["last_checked_at"]
-            if checked:
-                checked_at_by_key[server.key] = str(checked)
-        return servers, latency_by_key, checked_at_by_key
+                self._latency_by_key[server.key] = float(lat)
+        return rows, servers
 
-    def _load_primary_servers(
-        self,
-    ) -> tuple[list[V2RayServer], dict[str, float], dict[str, str]]:
-        """Working servers with catalog latency ≤ max."""
-        config = load_config(required=False)
-        db, _mt, _v2 = open_catalogs(config)
-        try:
-            rows = db.conn.execute(
-                """
-                SELECT * FROM v2ray
-                WHERE status = 'working'
-                  AND last_latency_ms IS NOT NULL
-                  AND last_latency_ms <= ?
-                ORDER BY last_latency_ms ASC, key
-                """,
-                (self.max_latency_ms,),
-            ).fetchall()
-            return self._filter_compatible_rows(rows)
-        finally:
-            db.close()
+    def _is_cooling(self, key: str, *, now: float) -> bool:
+        lease = self._leases.get(key)
+        if lease is None:
+            return False
+        return (now - lease.used_at) < self.min_reuse_sec
 
-    def _load_recovery_servers(
-        self,
-    ) -> tuple[list[V2RayServer], dict[str, float], dict[str, str]]:
-        """All known catalog servers (working first, then history) for live re-test."""
-        config = load_config(required=False)
-        db, _mt, _v2 = open_catalogs(config)
-        try:
-            rows = db.conn.execute(
-                """
-                SELECT * FROM v2ray
-                ORDER BY
-                    CASE status WHEN 'working' THEN 0 ELSE 1 END,
-                    CASE WHEN last_latency_ms IS NULL THEN 1 ELSE 0 END,
-                    last_latency_ms ASC,
-                    success_count DESC,
-                    priority_score DESC,
-                    key
-                """
-            ).fetchall()
-            return self._filter_compatible_rows(rows)
-        finally:
-            db.close()
-
-    def _is_reusable(self, key: str, *, now: float, rotation: int) -> bool:
-        record = self._usage.get(key)
-        if record is None:
-            return True
-        rotations_ago = rotation - record.rotation
-        age_sec = now - record.used_at
-        return (
-            rotations_ago >= self.reuse_after_rotations
-            or age_sec >= self.reuse_after_sec
-        )
-
-    def _server_latency(self, server: V2RayServer) -> float:
-        return self._latency_by_key.get(server.key, self.max_latency_ms)
-
-    def _ordered_candidates(self, pool: list[V2RayServer]) -> list[V2RayServer]:
-        """Eligible servers ordered for assignment (off cooldown first)."""
-        if not pool:
-            return []
+    async def _refresh_hot_and_assign(self, *, initial: bool) -> None:
+        rows, servers = self._catalog_rows()
+        if not servers:
+            self._log(
+                f"[proxy pool] no eligible V2Ray servers ≤ {self.max_latency_ms:.0f} ms "
+                f"— retrying in {int(EMPTY_CATALOG_WAIT_SEC)}s"
+            )
+            return
 
         now = time.monotonic()
-        rotation = self._rotation_round
-        previous_blocked = {
-            key
-            for key in self._previous_keys
-            if not self._is_reusable(key, now=now, rotation=rotation)
+        cooling = {key for key in servers if self._is_cooling(key, now=now)}
+        assigned = {
+            slot.server.key for slot in self._slots if slot.server is not None
         }
+        hot = select_hot_set(
+            rows,
+            active=self.count,
+            standby=self.standby_outbounds,
+            reserve=self.reserve_outbounds,
+            assigned=assigned,
+            cooling=cooling,
+        )
+        await self._sync_loaded_outbounds(hot.all_keys, servers)
 
-        available: list[V2RayServer] = []
-        cooling: list[tuple[float, V2RayServer]] = []
-        for server in pool:
-            if server.key in previous_blocked:
-                record = self._usage.get(server.key)
-                score = record.used_at if record else 0.0
-                cooling.append((score, server))
+        if initial or not any(slot.server for slot in self._slots):
+            await self._assign_keys(hot.all_keys, servers, replace_all=True)
+            self._log(
+                f"[proxy pool] hot ring loaded: active={len(hot.active_keys)} "
+                f"standby={len(hot.standby_keys)} reserve={len(hot.reserve_keys)} "
+                f"xray_outbounds={len(self._loaded_tags)}"
+            )
+            return
+
+        # Event-driven: replace only dead/empty slots from standby.
+        standby = [key for key in hot.standby_keys if key in servers]
+        await self._repair_slots(servers, standby)
+
+    async def _sync_loaded_outbounds(
+        self, keys: list[str], servers: dict[str, V2RayServer]
+    ) -> None:
+        if self._handler is None:
+            return
+        wanted = {node_outbound_tag(key): key for key in keys if key in servers}
+        for tag in list(self._loaded_tags):
+            if tag not in wanted and tag != fallback_outbound_tag():
+                try:
+                    await self._handler.remove_outbound(tag)
+                except Exception:
+                    pass
+                self._loaded_tags.discard(tag)
+        for tag, key in wanted.items():
+            if tag in self._loaded_tags:
                 continue
-            if self._is_reusable(server.key, now=now, rotation=rotation):
-                available.append(server)
-            else:
-                record = self._usage[server.key]
-                cooling.append((record.used_at, server))
+            outbound = link_to_xray_outbound(servers[key])
+            if outbound is None:
+                continue
+            try:
+                await self._handler.add_outbound(outbound, tag=tag)
+                self._loaded_tags.add(tag)
+            except Exception as exc:
+                self._log(
+                    f"[proxy pool] AddOutbound {tag} failed: {exc}"
+                )
 
+    async def _assign_keys(
+        self,
+        keys: list[str],
+        servers: dict[str, V2RayServer],
+        *,
+        replace_all: bool,
+    ) -> None:
+        if self._routing is None:
+            return
+        ordered = [key for key in keys if key in servers]
         if self.random_pick:
-            random.shuffle(available)
-            random.shuffle(cooling)
-        else:
-            available.sort(key=self._server_latency)
-        cooling.sort(key=lambda item: item[0])
-
-        ordered: list[V2RayServer] = []
-        seen: set[str] = set()
-        for server in available:
-            if server.key in seen:
-                continue
-            ordered.append(server)
-            seen.add(server.key)
-        reused = 0
-        for _score, server in cooling:
-            if server.key in seen:
-                continue
-            ordered.append(server)
-            seen.add(server.key)
-            reused += 1
-        if reused:
-            self._log(
-                f"[proxy pool] only {len(available)} server(s) off cooldown; "
-                f"{reused} still cooling (may reuse if needed)"
-            )
-        return ordered
-
-    def _candidate_pools(self) -> list[tuple[str, list[V2RayServer]]]:
-        """Primary pre-tested pool, then full catalog for live re-test."""
-        pools: list[tuple[str, list[V2RayServer]]] = []
-        if self._servers:
-            pools.append(("pre-tested", self._servers))
-        if self._recovery_servers:
-            pools.append(("catalog", self._recovery_servers))
-        return pools
-
-    def _candidates_for_slot(
-        self,
-        ordered: list[V2RayServer],
-        *,
-        blocked: set[str],
-        used: set[str],
-    ) -> list[V2RayServer]:
-        preferred = [
-            server
-            for server in ordered
-            if server.key not in blocked and server.key not in used
-        ]
-        fallback = [
-            server
-            for server in ordered
-            if server.key not in blocked and server.key in used
-        ]
-        return preferred + fallback
-
-    def _slot_is_healthy(self, slot: _ProxySlot) -> bool:
-        return (
-            self._pool_process_alive()
-            and slot.error is None
-            and slot.server is not None
-        )
-
-    def _test_settings(self) -> tuple[str, float]:
-        config = load_config(required=False)
-        test_url = DEFAULT_TEST_URL
-        timeout = DEFAULT_TEST_TIMEOUT
-        if config is not None:
-            test_url = str(getattr(config, "V2RAY_TEST_URL", DEFAULT_TEST_URL))
-            raw_timeout = getattr(config, "V2RAY_TEST_TIMEOUT", DEFAULT_TEST_TIMEOUT)
-            try:
-                timeout = float(raw_timeout)
-            except (TypeError, ValueError):
-                timeout = DEFAULT_TEST_TIMEOUT
-        return test_url, max(1.0, timeout)
-
-    def _validate_upstream(
-        self, http_port: int
-    ) -> tuple[bool, float | None, str | None]:
-        """HTTP GET through a local HTTP proxy. Returns (ok, latency_s, error)."""
-        test_url, timeout = self._test_settings()
-        proxy_url = f"http://127.0.0.1:{http_port}"
-        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-        opener = urllib.request.build_opener(handler)
-        started = time.perf_counter()
-        try:
-            with opener.open(test_url, timeout=timeout) as resp:
-                status = getattr(resp, "status", None)
-                if status is None:
-                    status = resp.getcode()
-                resp.read(1024)
-                if status is None or not (200 <= int(status) < 400):
-                    return False, None, f"HTTP {status}"
-                return True, time.perf_counter() - started, None
-        except Exception as exc:
-            detail = str(exc) or type(exc).__name__
-            if isinstance(exc, urllib.error.URLError) and exc.reason:
-                detail = str(exc.reason)
-            return False, None, detail
-
-    def _record_probe(
-        self,
-        server: V2RayServer,
-        *,
-        ok: bool,
-        latency_s: float | None,
-        error: str | None,
-    ) -> None:
-        config = load_config(required=False)
-        db, _mt, _v2 = open_catalogs(config)
-        try:
-            db.v2ray_record_result(
-                server.key,
-                ok=ok,
-                latency_s=latency_s,
-                error=error,
-                identity=server.as_db_row(),
-            )
-        finally:
-            db.close()
-
-    def _record_usage(self, servers: list[V2RayServer]) -> None:
+            random.shuffle(ordered)
         now = time.monotonic()
-        self._previous_keys = list(self._current_keys)
-        self._current_keys = [server.key for server in servers]
-        for server in servers:
-            self._usage[server.key] = _UsageRecord(
-                rotation=self._rotation_round,
-                used_at=now,
-            )
-
-    def _temp_cfg_path(self, prefix: str) -> Path:
-        return Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / (
-            f"{prefix}-{int(time.time() * 1000)}.json"
-        )
-
-    def _stop_process(
-        self, proc: subprocess.Popen | None, cfg_path: Path | None
-    ) -> None:
-        if proc is not None and proc.poll() is None:
-            kill_process_tree(proc)
-        if cfg_path is not None:
-            try:
-                cfg_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    def _stop_test_session(self) -> None:
-        session = self._test_session
-        self._test_session = None
-        if session is not None:
-            try:
-                session.stop()
-            except Exception:
-                pass
-
-    def _stop_pool_process(self) -> None:
-        self._commit_all_traffic()
-        self._stop_process(self._pool_process, self._pool_cfg_path)
-        self._pool_process = None
-        self._pool_cfg_path = None
-
-    def _start_xray(self, config: dict, *, prefix: str) -> tuple[subprocess.Popen, Path]:
-        if not self._bin_path:
-            raise RuntimeError("xray binary not resolved")
-        cfg_path = self._temp_cfg_path(prefix)
-        cfg_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-        try:
-            proc = subprocess.Popen(
-                [self._bin_path, "run", "-c", str(cfg_path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **hide_console_kwargs(),
-            )
-        except OSError:
-            try:
-                cfg_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        return proc, cfg_path
-
-    def _ensure_test_session(self) -> bool:
-        """Start (or reuse) the long-lived validation Xray used between candidates."""
-        if self._test_session is not None and self._test_session.running:
-            return True
-        if not self._bin_path:
-            return False
-        self._stop_test_session()
-        if self._stop_event.is_set():
-            return False
-        slot = pool_test_live_slot(self.test_base_port)
-        self._test_socks_port = int(slot.socks_port or self.test_base_port)
-        self._test_http_port = int(slot.http_port or (self.test_base_port + 1))
-        self._test_api_port = pool_test_api_port(self.test_base_port)
-        session = XrayLiveSession(
-            bin_path=self._bin_path,
-            slots=[slot],
-            api_port=self._test_api_port,
-            prefix="fetch-mtproto-pool-test",
-        )
-        try:
-            session.start(ready_timeout=12.0)
-        except Exception as exc:
-            self._log(f"[proxy pool] test xray failed to start: {exc}")
-            try:
-                session.stop()
-            except Exception:
-                pass
-            return False
-        self._test_session = session
-        return True
-
-    def _validate_on_test_process(
-        self,
-        server: V2RayServer,
-        *,
-        allow_slow: bool = False,
-        skip_live_test: bool = False,
-    ) -> tuple[SlotStartResult, str | None]:
-        """Validate a candidate on the long-lived test Xray (not pool ports)."""
-        if self._stop_event.is_set():
-            return "failed", "stopped"
-
-        if skip_live_test:
-            latency_ms = self._latency_by_key.get(server.key, self.max_latency_ms)
-            if latency_ms > self.max_latency_ms and not allow_slow:
-                return (
-                    "slow",
-                    f"latency {latency_ms:.0f} ms > {self.max_latency_ms:.0f} ms",
-                )
-            return "ok", None
-
-        outbound = link_to_xray_outbound(server)
-        if outbound is None:
-            return "failed", f"unsupported scheme: {server.scheme}"
-
-        if not self._ensure_test_session():
-            if self._stop_event.is_set():
-                return "failed", "stopped"
-            return "failed", "test xray not available"
-        if self._stop_event.is_set():
-            return "failed", "stopped"
-
-        assert self._test_session is not None
-        try:
-            self._test_session.set_slot_outbound(0, outbound)
-        except Exception as exc:
-            detail = str(exc) or type(exc).__name__
-            self._record_probe(server, ok=False, latency_s=None, error=detail)
-            return "failed", f"outbound swap failed: {detail}"
-
-        if self._stop_event.is_set():
-            return "failed", "stopped"
-
-        ok, latency_s, error = self._validate_upstream(self._test_http_port)
-
-        if not ok or latency_s is None:
-            detail = error or "upstream check failed"
-            self._record_probe(server, ok=False, latency_s=None, error=detail)
-            return "failed", detail
-
-        latency_ms = latency_s * 1000.0
-        self._record_probe(server, ok=True, latency_s=latency_s, error=None)
-        self._latency_by_key[server.key] = latency_ms
-        if latency_ms > self.max_latency_ms and not allow_slow:
-            return (
-                "slow",
-                f"latency {latency_ms:.0f} ms > {self.max_latency_ms:.0f} ms",
-            )
-        return "ok", None
-
-    def _apply_pool_assignments(self, assignments: list[V2RayServer | None]) -> None:
-        """Restart the shared pool Xray once with the given per-slot upstreams."""
-        if self._stop_event.is_set():
-            return
-
-        with self._slots_lock:
-            slots = list(self._slots)
-        if len(assignments) != len(slots):
-            raise ValueError("assignment count must match slot count")
-
-        outbounds: list[dict | None] = []
-        for server in assignments:
-            if server is None:
-                outbounds.append(None)
+        fresh = [key for key in ordered if not self._is_cooling(key, now=now)]
+        cooling = [key for key in ordered if self._is_cooling(key, now=now)]
+        preferred = fresh + cooling
+        if replace_all:
+            keep: list[str | None] = [None] * len(self._slots)
+        else:
+            keep = [
+                slot.server.key
+                if slot.server is not None and slot.server.key in servers
+                else None
+                for slot in self._slots
+            ]
+        mapped, extra = spread_keys(len(self._slots), preferred, keep=keep)
+        assignments: dict[str, str] = {}
+        slot_servers: list[V2RayServer | None] = []
+        for index, key in enumerate(mapped):
+            if key is None or key not in servers:
+                slot_servers.append(None)
                 continue
-            outbound = link_to_xray_outbound(server)
-            outbounds.append(outbound)
+            tag = node_outbound_tag(key)
+            assignments[balancer_tag(index)] = tag
+            slot_servers.append(servers[key])
+            self._leases[key] = _Lease(slot=index, used_at=now)
 
-        active = [ob for ob in outbounds if ob is not None]
-        self._stop_pool_process()
-        if self._stop_event.is_set():
-            return
-
-        if not active:
-            for slot, server in zip(slots, assignments):
-                slot.server = server
-                slot.error = "no working upstream found"
-            return
-
-        config = build_xray_multi_pool_config(
-            outbounds,
-            start_port=self.start_port,
-            api_port=self._api_port,
-        )
-        try:
-            proc, cfg_path = self._start_xray(config, prefix="fetch-mtproto-pool")
-        except OSError as exc:
-            for slot in slots:
-                slot.error = f"xray start failed: {exc}"
-            return
-
-        self._pool_process = proc
-        self._pool_cfg_path = cfg_path
-
-        for index, (slot, server) in enumerate(zip(slots, assignments)):
-            slot.server = server
-            if server is None:
-                slot.error = "no working upstream found"
-                continue
-            if outbounds[index] is None:
-                slot.error = f"unsupported scheme: {server.scheme}"
-                slot.server = None
-                continue
-            if not self._wait_port("127.0.0.1", slot.socks_port, timeout=8.0):
-                if self._stop_event.is_set():
-                    return
-                slot.error = "SOCKS5 port did not open"
-                continue
-            if not self._wait_port("127.0.0.1", slot.http_port, timeout=8.0):
-                if self._stop_event.is_set():
-                    return
-                slot.error = "HTTP port did not open"
-                continue
-            slot.error = None
-
-        if self._stop_event.is_set():
-            self._stop_pool_process()
-
-    def _pick_validated_server(
-        self,
-        index: int,
-        slot: _ProxySlot,
-        *,
-        initial: bool,
-        rotate: bool,
-        blocked: set[str],
-        used: set[str],
-    ) -> V2RayServer | None:
-        """Try candidates on the test process; return a validated upstream or None."""
-        for label, pool in self._candidate_pools():
-            ordered = self._ordered_candidates(pool)
-            if not ordered:
-                continue
-            candidates = self._candidates_for_slot(
-                ordered, blocked=blocked, used=used
-            )
-            if not candidates and ordered:
-                candidates = [
-                    server for server in ordered if server.key not in blocked
-                ]
-            attempts = 0
-            for server in candidates:
-                if self._stop_event.is_set():
-                    return None
-                if attempts >= MAX_VALIDATE_ATTEMPTS_PER_SLOT:
-                    break
-                attempts += 1
-                if initial or rotate:
-                    if initial:
-                        self._log(
-                            f"[proxy pool] slot {index + 1}/{self.count}: "
-                            f"SOCKS5 127.0.0.1:{slot.socks_port}, "
-                            f"HTTP 127.0.0.1:{slot.http_port} → "
-                            f"testing {server.host}:{server.port} ({server.scheme}) "
-                            f"[{label}]"
-                        )
-                    else:
-                        self._log(
-                            f"[proxy pool] slot {index + 1}/{self.count}: "
-                            f"testing {server.host}:{server.port} ({server.scheme}) "
-                            f"[{label}]"
-                        )
-                else:
-                    self._log(
-                        f"[proxy pool] slot {index + 1}/{self.count}: "
-                        f"retry {server.host}:{server.port} ({server.scheme}) "
-                        f"[{label}]"
-                    )
-                allow_slow = label == "catalog"
-                trust_catalog = self._trust_catalog_latency(
-                    server, allow_slow=allow_slow, initial=initial
-                )
-                result, detail = self._validate_on_test_process(
-                    server,
-                    allow_slow=allow_slow,
-                    skip_live_test=trust_catalog,
-                )
-                if result == "ok":
-                    latency = self._latency_by_key.get(server.key)
-                    latency_txt = (
-                        f"{latency:.0f} ms" if latency is not None else "ok"
-                    )
-                    if trust_catalog:
-                        self._log(
-                            f"[proxy pool] slot {index + 1}/{self.count}: "
-                            f"validated {server.host}:{server.port} "
-                            f"({latency_txt}, catalog)"
-                        )
-                    elif allow_slow and latency is not None and latency > self.max_latency_ms:
-                        self._log(
-                            f"[proxy pool] slot {index + 1}/{self.count}: "
-                            f"using slow upstream {server.host}:{server.port} "
-                            f"({latency_txt}) — no faster servers available"
-                        )
-                    else:
-                        self._log(
-                            f"[proxy pool] slot {index + 1}/{self.count}: "
-                            f"validated {server.host}:{server.port} ({latency_txt})"
-                        )
-                    used.add(server.key)
-                    return server
-                if result == "slow":
-                    blocked.add(server.key)
-                    self._log(
-                        f"[proxy pool] slot {index + 1}/{self.count}: "
-                        f"skipped {server.host}:{server.port} "
-                        f"(above {self.max_latency_ms:.0f} ms)"
-                    )
-                    continue
-                blocked.add(server.key)
-                self._log(
-                    f"[proxy pool] slot {index + 1}/{self.count}: "
-                    f"rejected {server.host}:{server.port} — "
-                    f"{detail or 'upstream check failed'}"
-                )
-        return None
-
-    def _start_all_slots(self, *, initial: bool) -> None:
-        with self._slots_lock:
-            slots = list(self._slots)
-        if not slots:
-            return
-
-        if not self._candidate_pools():
+        if assignments:
+            errors = await self._routing.override_many(assignments)
+            failed = sum(1 for err in errors if err)
+            if failed:
+                self._log(f"[proxy pool] {failed} balancer override(s) failed")
+        if extra:
+            unique_n = len({key for key in mapped if key})
             self._log(
-                "[proxy pool] no servers to assign — will retry on next cycle"
+                f"[proxy pool] hot set exhausted — reused {unique_n} node(s) "
+                f"on {extra} extra slot(s)"
             )
-            return
 
-        cooling = sum(
-            1
-            for key, record in self._usage.items()
-            if not self._is_reusable(
-                key, now=time.monotonic(), rotation=self._rotation_round
-            )
-        )
-        mode = "random" if self.random_pick else "fastest-first"
-        primary_n = len(self._servers)
-        recovery_n = len(self._recovery_servers)
-        self._log(
-            f"[proxy pool] validating upstreams ({mode}): "
-            f"{primary_n} pre-tested, {recovery_n} in catalog; "
-            f"{cooling} server(s) on cooldown "
-            f"(reuse after {self.reuse_after_rotations} rotations or "
-            f"{int(self.reuse_after_sec) // 60} min)"
-        )
-
-        self._assigning_slots = True
-        try:
-            blocked: set[str] = set()
-            used: set[str] = set()
-            assigned: list[V2RayServer] = []
-            assignments: list[V2RayServer | None] = []
-
-            for index, slot in enumerate(slots):
-                if self._stop_event.is_set():
-                    return
-                # Rotate healthy slots on schedule; always try to fill dead ones.
-                rotate = initial or self._slot_is_healthy(slot)
-                server = self._pick_validated_server(
-                    index,
-                    slot,
-                    initial=initial,
-                    rotate=rotate,
-                    blocked=blocked,
-                    used=used,
+        with self._slots_lock:
+            for slot, server in zip(self._slots, slot_servers):
+                slot.server = server
+                slot.outbound_tag = (
+                    node_outbound_tag(server.key) if server else None
                 )
-                if server is not None:
-                    assignments.append(server)
-                    assigned.append(server)
-                else:
-                    assignments.append(None)
-                    if rotate:
-                        self._log(
-                            f"[proxy pool] slot {index + 1}/{self.count}: "
-                            f"no valid upstream this cycle — will retry"
-                        )
+                slot.error = None if server else "no working upstream found"
 
-            self._apply_pool_assignments(assignments)
-            if assigned:
-                self._record_usage(assigned)
-        finally:
-            self._assigning_slots = False
+        self._generation += 1
+        try:
+            config = load_config(required=False)
+            db, _mt, _v2 = open_catalogs(config)
+            db.replace_pool_assignments(
+                [
+                    (i, srv.key if srv else None)
+                    for i, srv in enumerate(slot_servers)
+                ],
+                generation=self._generation,
+            )
+        except Exception:
+            pass
 
-        running = sum(1 for slot in slots if self._slot_is_healthy(slot))
-        self._log(
-            f"[proxy pool] {running}/{len(slots)} slot(s) running with "
-            f"validated upstreams (1 pool xray + 1 long-lived test xray)"
-        )
-
-    def _repair_dead_slots(self) -> None:
-        """Immediately retry failed or crashed slots without waiting for rotation."""
-        if self._assigning_slots:
-            return
+    async def _repair_slots(
+        self, servers: dict[str, V2RayServer], standby: list[str]
+    ) -> None:
         with self._slots_lock:
             slots = list(self._slots)
-        if not slots:
-            return
-
-        # Shared process crash: re-apply known assignments without re-validating.
-        if not self._pool_process_alive() and any(slot.server for slot in slots):
-            self._log("[proxy pool] pool xray exited — restarting with current upstreams")
-            self._apply_pool_assignments([slot.server for slot in slots])
-            self._emit_status()
-            if self._pool_process_alive():
-                return
-
-        if not self._candidate_pools():
-            return
-
-        blocked: set[str] = set()
-        used: set[str] = set()
-        assigned: list[V2RayServer] = []
-        assignments: list[V2RayServer | None] = []
-        changed = False
-
+        need: list[int] = []
         for index, slot in enumerate(slots):
-            if self._stop_event.is_set():
-                return
-            if self._slot_is_healthy(slot):
-                assignments.append(slot.server)
-                if slot.server is not None:
-                    used.add(slot.server.key)
-                continue
-
-            server = self._pick_validated_server(
-                index,
-                slot,
-                initial=False,
-                rotate=False,
-                blocked=blocked,
-                used=used,
-            )
-            if server is not None:
-                assignments.append(server)
-                assigned.append(server)
-                changed = True
-                self._log(
-                    f"[proxy pool] slot {index + 1}/{self.count}: "
-                    "recovered after failure"
-                )
+            if slot.server is None or slot.server.key not in servers:
+                need.append(index)
+        if not need:
+            return
+        unique_pool = [k for k in standby if k in servers]
+        reuse_pool = unique_pool or [k for k in servers]
+        assigned = {
+            slot.server.key for slot in slots if slot.server is not None
+        }
+        replacements: dict[str, str] = {}
+        now = time.monotonic()
+        reused = 0
+        rr = 0
+        for index in need:
+            key = next((k for k in unique_pool if k not in assigned), None)
+            if key is None:
+                if not reuse_pool:
+                    continue
+                key = reuse_pool[rr % len(reuse_pool)]
+                rr += 1
+                reused += 1
             else:
-                assignments.append(None)
-                changed = True
+                assigned.add(key)
+            replacements[balancer_tag(index)] = node_outbound_tag(key)
+            with self._slots_lock:
+                self._slots[index].server = servers[key]
+                self._slots[index].outbound_tag = node_outbound_tag(key)
+                self._slots[index].error = None
+            self._leases[key] = _Lease(slot=index, used_at=now)
+        if replacements and self._routing is not None:
+            await self._routing.override_many(replacements)
+            msg = f"[proxy pool] repaired {len(replacements)} dead slot(s)"
+            if reused:
+                msg += f" ({reused} by reusing nodes; hot set exhausted)"
+            self._log(msg)
 
-        if changed:
-            self._apply_pool_assignments(assignments)
-            if assigned:
-                self._record_usage(assigned)
-            self._emit_status()
+    async def _rotate_all(self) -> None:
+        rows, servers = self._catalog_rows()
+        if not servers:
+            return
+        now = time.monotonic()
+        cooling = {key for key in servers if self._is_cooling(key, now=now)}
+        hot = select_hot_set(
+            rows,
+            active=self.count,
+            standby=self.standby_outbounds,
+            reserve=self.reserve_outbounds,
+            cooling=cooling,
+        )
+        await self._sync_loaded_outbounds(hot.all_keys, servers)
+        await self._assign_keys(hot.all_keys, servers, replace_all=True)
+        self._log(f"[proxy pool] rotate-all generation {self._generation}")
 
-    def _commit_all_traffic(self) -> None:
+    async def _refresh_traffic(self) -> None:
+        if self._stats is None or not self._pool_process_alive():
+            return
+        try:
+            traffic = await self._stats.outbound_traffic()
+        except Exception:
+            return
         with self._slots_lock:
             slots = list(self._slots)
         for slot in slots:
-            self._commit_slot_traffic(slot)
-
-    def _commit_slot_traffic(self, slot: _ProxySlot) -> None:
-        """Fold current Xray counters into lifetime totals before process restart."""
-        self._poll_slot_traffic(slot)
-        slot.base_upload = slot.upload_bytes
-        slot.base_download = slot.download_bytes
-
-    def _traffic_loop(self) -> None:
-        while not self._stop_event.wait(TRAFFIC_POLL_SEC):
-            self._refresh_all_traffic()
-            self._repair_dead_slots()
-            self._emit_status()
-
-    def _refresh_all_traffic(self) -> None:
-        with self._slots_lock:
-            slots = list(self._slots)
-        if not self._pool_process_alive():
-            return
-        stats = self._query_all_outbound_traffic()
-        for index, slot in enumerate(slots):
-            if self._stop_event.is_set():
-                return
-            up, down = stats.get(index, (0, 0))
+            tag = slot.outbound_tag
+            if not tag:
+                continue
+            up, down = traffic.get(tag, (0, 0))
             slot.upload_bytes = slot.base_upload + up
             slot.download_bytes = slot.base_download + down
 
-    def _poll_slot_traffic(self, slot: _ProxySlot) -> None:
-        if not self._pool_process_alive():
-            return
-        with self._slots_lock:
-            try:
-                index = self._slots.index(slot)
-            except ValueError:
-                return
-        stats = self._query_all_outbound_traffic()
-        up, down = stats.get(index, (0, 0))
-        slot.upload_bytes = slot.base_upload + up
-        slot.download_bytes = slot.base_download + down
+    def _start_xray(self, config: dict, *, prefix: str = "fetch-mtproto-pool"):
+        if not self._bin_path:
+            raise RuntimeError("xray binary not resolved")
+        cfg_path = Path(os.environ.get("TEMP", os.environ.get("TMP", "/tmp"))) / (
+            f"{prefix}-{int(time.time() * 1000)}.json"
+        )
+        cfg_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        proc = subprocess.Popen(
+            [self._bin_path, "run", "-c", str(cfg_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            **hide_console_kwargs(),
+        )
+        return proc, cfg_path
 
-    def _query_all_outbound_traffic(self) -> dict[int, tuple[int, int]]:
-        """Return slot_index -> (uplink, downlink) from the shared Stats API."""
-        if not self._bin_path or self._api_port <= 0:
-            return {}
-        try:
-            result = subprocess.run(
-                [
-                    self._bin_path,
-                    "api",
-                    "statsquery",
-                    f"--server=127.0.0.1:{self._api_port}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-                **hide_console_kwargs(),
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return {}
-        if result.returncode != 0 or not result.stdout.strip():
-            return {}
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return {}
-
-        by_index: dict[int, list[int]] = {}
-        for item in payload.get("stat") or []:
-            name = str(item.get("name") or "")
+    def _kill_process(self) -> None:
+        if self._pool_process is not None and self._pool_process.poll() is None:
+            kill_process_tree(self._pool_process)
+        self._pool_process = None
+        if self._pool_cfg_path is not None:
             try:
-                value = int(item.get("value") or 0)
-            except (TypeError, ValueError):
-                value = 0
-            # outbound>>>proxy-3>>>traffic>>>uplink
-            if not name.startswith("outbound>>>proxy-"):
-                continue
-            parts = name.split(">>>")
-            if len(parts) != 4 or parts[2] != "traffic":
-                continue
-            tag = parts[1]
-            direction = parts[3]
-            if not tag.startswith("proxy-"):
-                continue
-            try:
-                index = int(tag.split("-", 1)[1])
-            except (TypeError, ValueError):
-                continue
-            pair = by_index.setdefault(index, [0, 0])
-            if direction == "uplink":
-                pair[0] = value
-            elif direction == "downlink":
-                pair[1] = value
-        return {index: (pair[0], pair[1]) for index, pair in by_index.items()}
-
-    def _kill_all_processes(self) -> None:
-        self._stop_test_session()
-        self._stop_pool_process()
+                self._pool_cfg_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._pool_cfg_path = None
 
     def _cleanup_all(self) -> None:
-        self._kill_all_processes()
+        control = self._control
+        self._control = None
+        self._handler = None
+        self._routing = None
+        self._stats = None
+        if control is not None:
+            try:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(control.close())
+                finally:
+                    loop.close()
+            except Exception:
+                pass
+        self._kill_process()
         with self._slots_lock:
             self._slots = []
 
-    def _wait_port(self, host: str, port: int, *, timeout: float) -> bool:
+    async def _wait_port(self, host: str, port: int, *, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self._stop_event.is_set():
@@ -1110,11 +660,25 @@ class ProxyPoolRunner:
                 with socket.create_connection((host, port), timeout=0.2):
                     return True
             except OSError:
-                time.sleep(0.05)
+                await asyncio.sleep(0.05)
         return False
 
+    def snapshot(self) -> PoolSnapshot:
+        statuses = self.snapshot_statuses()
+        healthy = sum(1 for s in statuses if s.running)
+        dead = sum(1 for s in statuses if s.error)
+        lats = [s.latency_ms for s in statuses if s.latency_ms is not None]
+        avg = sum(lats) / len(lats) if lats else None
+        return PoolSnapshot(
+            total=len(statuses),
+            healthy=healthy,
+            degraded=max(0, len(statuses) - healthy - dead),
+            dead=dead,
+            average_latency=avg,
+            slots=statuses,
+        )
+
     def snapshot_statuses(self) -> list[ProxySlotStatus]:
-        """Return current slot statuses for UI tests / display."""
         latency_by_key = dict(self._latency_by_key)
         pool_alive = self._pool_process_alive()
         with self._slots_lock:
@@ -1133,11 +697,14 @@ class ProxyPoolRunner:
                     error=slot.error,
                     upload_bytes=slot.upload_bytes,
                     download_bytes=slot.download_bytes,
+                    node_key=server.key if server else None,
                 )
             )
         return statuses
 
     def _emit_status(self) -> None:
-        if self._on_status is None:
-            return
-        self._on_status(self.snapshot_statuses())
+        snapshot = self.snapshot()
+        if self._on_status is not None:
+            self._on_status(snapshot.slots)
+        if self._on_snapshot is not None:
+            self._on_snapshot(snapshot)

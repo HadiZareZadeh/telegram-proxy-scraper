@@ -53,7 +53,7 @@ find_python() {
 }
 
 deps_satisfied() {
-  [[ -n "$PYTHON" ]] && "$PYTHON" -c "import telethon, python_socks, TelethonFakeTLS, cryptography" 2>/dev/null
+  [[ -n "$PYTHON" ]] && "$PYTHON" -c "import telethon, python_socks, TelethonFakeTLS, cryptography, grpc" 2>/dev/null
 }
 
 find_xray_on_path() {
@@ -151,7 +151,8 @@ else
     if [[ -n "$XRAY_ASSET" ]]; then
       rm -rf "$TMP_DIR"
       mkdir -p "$TMP_DIR/xray"
-      XRAY_URL="https://github.com/XTLS/Xray-core/releases/latest/download/$XRAY_ASSET"
+      XRAY_PIN="v26.3.27"
+      XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/$XRAY_PIN/$XRAY_ASSET"
       echo "  URL: $XRAY_URL"
       if ! curl -L --retry 3 --fail -o "$TMP_DIR/$XRAY_ASSET" "$XRAY_URL"; then
         fail "Failed to download $XRAY_ASSET"

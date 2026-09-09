@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
-from fetch_mtproto.config_loader import resolve_max_working, resolve_subscription_limit
+from fetch_mtproto.config_loader import (
+    config_int,
+    resolve_max_working,
+    resolve_subscription_limit,
+)
 from fetch_mtproto.db import CatalogDB
 from fetch_mtproto.mtproto.store import ProxyCatalog, load_mtproto_from_text_file
 from fetch_mtproto.paths import PROJECT_ROOT
-from fetch_mtproto.prune import prune_settings_from_config, prune_mtproto, prune_v2ray
+from fetch_mtproto.prune import prune_mtproto, prune_settings_from_config, prune_v2ray
 from fetch_mtproto.v2ray.store import V2RAY_SCHEMES, V2RayCatalog, load_v2ray_from_text_file
 
 log = logging.getLogger("mtproto-scraper")
 
 LEGACY_MIGRATED_KEY = "legacy_txt_migrated"
+
+_SHARED_LOCK = threading.Lock()
+_SHARED_DB: dict[str, CatalogDB] = {}
 
 
 def database_path(config_module=None) -> Path:
@@ -99,30 +107,46 @@ def migrate_legacy_text_files(db: CatalogDB, config_module=None) -> None:
     db.set_meta(LEGACY_MIGRATED_KEY, "1")
 
 
+def get_shared_db(config_module=None) -> CatalogDB:
+    path = database_path(config_module).resolve()
+    key = str(path)
+    with _SHARED_LOCK:
+        db = _SHARED_DB.get(key)
+        if db is None:
+            db = CatalogDB(path, shared=True)
+            _SHARED_DB[key] = db
+        return db
+
+
 def open_catalogs(config_module=None) -> tuple[CatalogDB, ProxyCatalog, V2RayCatalog]:
-    db = CatalogDB(database_path(config_module))
+    db = get_shared_db(config_module)
     migrate_legacy_text_files(db, config_module)
     mt_max = None
-    v2_max = None
     v2_sub_limit = 100
+    catalog_max = 10000
     if config_module is not None:
         mt_max = resolve_max_working(getattr(config_module, "MTPROTO_MAX_WORKING", 0))
-        v2_max = resolve_max_working(getattr(config_module, "V2RAY_MAX_WORKING", 0))
         v2_sub_limit = resolve_subscription_limit(
             getattr(config_module, "V2RAY_SUBSCRIPTION_LIMIT", None)
+        )
+        catalog_max = config_int(
+            getattr(config_module, "V2RAY_CATALOG_MAX", None), 10000, minimum=0
         )
     prune_settings = prune_settings_from_config(config_module)
     mt_catalog = ProxyCatalog(db, max_working=mt_max, prune_settings=prune_settings)
     v2_catalog = V2RayCatalog(
         db,
         subscription_path=subscription_path(config_module),
-        max_working=v2_max,
+        max_working=None,
         subscription_limit=v2_sub_limit,
         prune_settings=prune_settings,
+        catalog_max=catalog_max,
     )
     if prune_settings.enabled:
         mt_pruned = prune_mtproto(db, prune_settings)
         v2_pruned = prune_v2ray(db, prune_settings)
         if mt_pruned["total"] or v2_pruned["total"]:
             v2_catalog.update_subscription()
+    if catalog_max > 0:
+        db.v2ray_enforce_catalog_max(catalog_max)
     return db, mt_catalog, v2_catalog

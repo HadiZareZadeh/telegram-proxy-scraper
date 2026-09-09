@@ -246,3 +246,69 @@ def is_probe_eligible(snap: HealthSnapshot, *, now: datetime | None = None) -> b
     if until is None:
         return True
     return (now or utc_now()) >= until
+
+
+V2RAY_STATES = ("unknown", "healthy", "degraded", "dead", "quarantined")
+
+
+def derive_v2ray_state(
+    *,
+    ok: bool | None,
+    check_count: int,
+    consecutive_failures: int,
+    last_latency_ms: float | None,
+    max_hot_latency_ms: float = 3000.0,
+) -> str:
+    """Health attribute independent of ranking / hot-set membership."""
+    if check_count <= 0 or ok is None:
+        return "unknown"
+    if ok and consecutive_failures <= 0:
+        if last_latency_ms is not None and last_latency_ms > 2000.0:
+            return "degraded"
+        if last_latency_ms is not None and last_latency_ms > max_hot_latency_ms:
+            return "degraded"
+        return "healthy"
+    if consecutive_failures >= 3:
+        return "dead"
+    if consecutive_failures > 0:
+        return "degraded"
+    return "unknown"
+
+
+def state_to_status(state: str) -> str:
+    """Legacy UI mapping: inventory is never 'failed' just for being off the hot set."""
+    if state in {"dead", "quarantined"}:
+        return "failed"
+    return "working"
+
+
+def next_probe_due_iso(
+    state: str,
+    *,
+    consecutive_failures: int = 0,
+    consecutive_successes: int = 0,
+    success_count: int = 0,
+    check_count: int = 0,
+    now: datetime | None = None,
+) -> str:
+    """Adaptive next-probe time (unknown now, healthy 5–15m, degraded 2m, dead backoff)."""
+    now = now or utc_now()
+    delay = 0
+    if state == "unknown" or check_count <= 0:
+        delay = 0
+    elif state == "degraded":
+        delay = 2 * 60
+    elif state == "healthy":
+        rate = (success_count + 1.0) / (max(check_count, 0) + 2.0)
+        if rate >= 0.9 and consecutive_successes >= 5:
+            delay = 15 * 60
+        else:
+            delay = 10 * 60
+    elif state == "dead":
+        # 10m, 30m, 1h, 3h …
+        steps = max(0, consecutive_failures - 3)
+        minutes = min(180, 10 * (3 ** min(steps, 4)))
+        delay = int(minutes * 60)
+    else:
+        delay = 30 * 60
+    return (now + timedelta(seconds=delay)).replace(microsecond=0).isoformat()

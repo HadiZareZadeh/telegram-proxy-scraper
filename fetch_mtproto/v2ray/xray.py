@@ -472,7 +472,7 @@ def build_xray_routed_config(
         config["stats"] = {}
         config["api"] = {
             "tag": "api",
-            "services": ["HandlerService", "StatsService"],
+            "services": ["HandlerService", "RoutingService", "StatsService"],
         }
         config["policy"] = {
             "system": {
@@ -490,6 +490,7 @@ def build_xray_routed_config(
                 "outboundTag": "api",
             },
         )
+        outbounds.append({"protocol": "freedom", "tag": "api"})
     return config
 
 
@@ -565,6 +566,153 @@ def build_xray_multi_pool_config(
 
 def pool_outbound_tag(slot_index: int) -> str:
     return f"proxy-{int(slot_index)}"
+
+
+def blackhole_json(tag: str) -> dict[str, Any]:
+    return {"protocol": "blackhole", "tag": tag, "settings": {}}
+
+
+def build_xray_slot_balancer_config(
+    *,
+    slot_count: int,
+    socks_start: int,
+    http_start: int,
+    api_port: int,
+    hot_outbounds: list[dict[str, Any]],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    """300 SOCKS+HTTP inbounds → per-slot balancers → hot outbounds.
+
+    Balancers use selector prefix ``n-`` and ``fallbackTag``. Assignment is
+    applied later via RoutingService.OverrideBalancerTarget (not leastPing).
+    """
+    from fetch_mtproto.v2ray.pool_ports import (
+        balancer_tag,
+        fallback_outbound_tag,
+        http_inbound_tag,
+        slot_ports,
+        socks_inbound_tag,
+    )
+
+    if slot_count <= 0:
+        raise ValueError("slot_count must be positive")
+
+    inbounds: list[dict[str, Any]] = [
+        {
+            "tag": "api",
+            "listen": "127.0.0.1",
+            "port": int(api_port),
+            "protocol": "dokodemo-door",
+            "settings": {"address": "127.0.0.1"},
+        }
+    ]
+    outbounds: list[dict[str, Any]] = []
+    rules: list[dict[str, Any]] = [
+        {"type": "field", "inboundTag": ["api"], "outboundTag": "api"}
+    ]
+    balancers: list[dict[str, Any]] = []
+
+    fallback_ob = dict(fallback)
+    fallback_ob["tag"] = fallback_outbound_tag()
+    outbounds.append(fallback_ob)
+
+    seen_tags: set[str] = {fallback_ob["tag"]}
+    for outbound in hot_outbounds:
+        tag = str(outbound.get("tag") or "").strip()
+        if not tag or tag in seen_tags:
+            continue
+        seen_tags.add(tag)
+        ob = dict(outbound)
+        ob["tag"] = tag
+        outbounds.append(ob)
+
+    for index in range(int(slot_count)):
+        socks_port, http_port = slot_ports(socks_start, http_start, index)
+        s_tag = socks_inbound_tag(index)
+        h_tag = http_inbound_tag(index)
+        b_tag = balancer_tag(index)
+        inbounds.append(
+            {
+                "tag": s_tag,
+                "listen": "127.0.0.1",
+                "port": int(socks_port),
+                "protocol": "socks",
+                "settings": {"udp": False, "auth": "noauth"},
+            }
+        )
+        inbounds.append(
+            {
+                "tag": h_tag,
+                "listen": "127.0.0.1",
+                "port": int(http_port),
+                "protocol": "http",
+                "settings": {},
+            }
+        )
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": [s_tag, h_tag],
+                "balancerTag": b_tag,
+            }
+        )
+        balancers.append(
+            {
+                "tag": b_tag,
+                "selector": ["n-"],
+                "fallbackTag": fallback_outbound_tag(),
+                "strategy": {"type": "random"},
+            }
+        )
+
+    outbounds.extend(
+        [
+            {"protocol": "freedom", "tag": "api"},
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "block"},
+        ]
+    )
+    return {
+        "log": {"loglevel": "error"},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": rules,
+            "balancers": balancers,
+        },
+        "stats": {},
+        "api": {
+            "tag": "api",
+            "services": ["HandlerService", "RoutingService", "StatsService"],
+        },
+        "burstObservatory": {
+            "subjectSelector": [fallback_outbound_tag()],
+            "pingConfig": {
+                "destination": "http://www.gstatic.com/generate_204",
+                "interval": "5m",
+                "timeout": "2s",
+                "sampling": 1,
+            },
+        },
+        "burstObservatory": {
+            "subjectSelector": [fallback_outbound_tag()],
+            "pingConfig": {
+                "destination": "http://www.gstatic.com/generate_204",
+                "interval": "5m",
+                "timeout": "2s",
+                "sampling": 1,
+            },
+        },
+        "policy": {
+            "system": {
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+            }
+        },
+    }
 
 
 def dumps_config(config: dict[str, Any]) -> str:

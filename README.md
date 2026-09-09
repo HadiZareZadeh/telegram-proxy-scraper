@@ -90,6 +90,44 @@ Working V2Ray rows are exported to `SUBSCRIPTION_FILE` (default `data/subscripti
 
 On first open, legacy text files under `data/mtproto/` and `data/v2ray/` are imported once.
 
+## Proxy pool architecture
+
+Python is the **control plane only**. Traffic stays: local client → Xray → upstream.
+
+```
+Telegram / URL ingest → SQLite inventory (up to 10,000)
+        → probe scheduler (probe_due_at)
+        → probe Xray (TCP prefilter then 256+ HTTP HEAD)
+        → hot-set engine (~750 outbounds)
+        → pool Xray (never restarted on rotate)
+        → local SOCKS + HTTP slots
+```
+
+| Layer | Typical size | Meaning |
+|-------|----------------|---------|
+| Inventory | 5,000–10,000 | Unique share links in SQLite (`v2ray.catalog_max`) |
+| Hot ring | ~750 | 300 active + 300 standby + 100 reserve loaded in the pool Xray |
+| Active slots | 300 | Local listeners; one upstream node per slot |
+| Subscription export | 100 | `v2ray.subscription_limit` — a query limit, not a store cap |
+
+**Rotation:** `Rotate all` flips already-loaded balancer targets via gRPC `OverrideBalancerTarget`. Existing TCP sessions do **not** migrate. A cold VLESS/REALITY handshake is still tens–hundreds of ms. Assignment is sub-ms to low-ms after parallel RPCs — not a 0.1 ms promise.
+
+Failed/empty slots are repaired from standby automatically. Optional `proxy_pool.diversity_rotate_sec` (default 0 = off) can shuffle healthy slots on a timer.
+
+### Ports (defaults)
+
+| Role | Range |
+|------|--------|
+| Pool SOCKS | 10801–11100 |
+| Pool HTTP | 11201–11500 |
+| Pool gRPC API (Handler + Routing + Stats) | 20802 |
+| Probe SOCKS | 45001–45256 (grows with `ping_concurrency`) |
+| Probe gRPC API | 45520 |
+
+Keep these below Windows ephemeral ports (typically 49152–65535). Setup pins **Xray-core v26.3.27**.
+
+Pinned control-plane gRPC: use the machine’s installed `grpcio` (this repo requires `grpcio>=1.67.1`).
+
 ## Adaptive probe scheduler
 
 Each catalog row tracks lifetime health:
@@ -101,29 +139,46 @@ Each catalog row tracks lifetime health:
 | `check_count` | Total probes |
 | `last_latency_ms` / `avg_latency_ms` | Last and EMA latency |
 | `last_error` / `last_checked_at` | Last failure reason + timestamp |
-| `skip_until` | Backoff deadline after repeated fails |
+| `skip_until` | Backoff deadline after repeated fails (MTProto) |
+| `state` | V2Ray: `unknown` / `healthy` / `degraded` / `dead` / `quarantined` |
+| `probe_due_at` | V2Ray next probe time |
 | `priority_score` | Explore / exploit / recover score |
 
-Probes are ordered by **highest `priority_score` first**:
+**V2Ray Ping** only probes rows whose `probe_due_at` is due:
 
-1. **Explore** — never-tested servers jump the queue.
-2. **Exploit** — high success rate + low latency stay near the front.
-3. **Recover** — chronic failures drop down but get sparse retries after exponential backoff (`PROBE_RESPECT_BACKOFF`).
+- unknown → now
+- healthy → +5–10 min (very healthy +10–15)
+- degraded → +2 min
+- dead → 10m / 30m / 1h / 3h exponential backoff
 
-Optional `MTPROTO_MAX_WORKING` / `V2RAY_MAX_WORKING` cap how many top-scoring servers are tested each cycle and kept in the working set (0 = unlimited). `V2RAY_SUBSCRIPTION_LIMIT` (default 100) controls how many fastest, most recently checked working servers are exported to `subscription.txt` (0 = unlimited).
+TCP connect is recorded separately from proxy-verified HTTP HEAD (`generate_204`). Healthy V2Ray rows are **not** demoted to failed just because they are outside the top 300.
+
+`mtproto.max_working` still caps the MTProto working set (0 = unlimited). `v2ray.max_working` is unused. `v2ray.subscription_limit` (default 100) controls how many fastest working servers are exported to `subscription.txt` (0 = unlimited).
 
 ## Behavior
 
 1. Scraper prefers an MTProto proxy; falls back to a direct connection if none work.
 2. On start (and every `url_sources.fetch_interval`), fetches V2Ray lists from `urls.txt` into the catalog.
 3. Scans recent Telegram messages for MTProto and V2Ray share URIs.
-4. Inserts new unique links into SQLite as working.
+4. Inserts new unique links into SQLite.
 5. Stays online for new posts.
-6. On `PROXY_CHECK_INTERVAL` (default 5 minutes), re-pings both catalogs.
+6. On `PROXY_CHECK_INTERVAL` (default 5 minutes), re-pings MTProto and **due** V2Ray rows.
 
 Edit `urls.txt` (one HTTP(S) URL per line) to control GitHub / subscription sources. Use the **URL sources** job in the GUI to run that fetch without Telegram, or leave it to the scraper.
 
-V2Ray health checks spin up a short-lived local Xray SOCKS inbound per server and HTTP-ping `V2RAY_TEST_URL`. Schemes Xray can outbound (`vmess`, `vless`, `trojan`, `ss`) are tested; others are marked failed as unsupported.
+V2Ray health checks: TCP prefilter, then HTTP HEAD (GET fallback) through a long-lived probe Xray. Schemes Xray can outbound (`vmess`, `vless`, `trojan`, `ss`) are tested.
+
+## Tests and benches
+
+```bat
+python -m unittest discover -s tests -v
+python scripts\bench_xray_rpc.py
+python scripts\bench_probe.py
+python scripts\xray_upgrade_regression.py
+```
+
+`xray_upgrade_regression.py --full` is the gate before bumping the pinned Xray version (300 inbounds, ~1000 outbounds, 100 rotations, same process).
+
 
 ## Fake TLS (`ee…`) proxies
 

@@ -466,11 +466,13 @@ class V2RayCatalog:
         max_working: int | None = None,
         subscription_limit: int | None = 100,
         prune_settings: PruneSettings | None = None,
+        catalog_max: int = 10000,
     ) -> None:
         self.db = db
         self.schemes = schemes
         self.subscription_path = Path(subscription_path)
-        self.max_working = max_working
+        self.max_working = None
+        self.catalog_max = int(catalog_max or 0)
         self.subscription_limit = subscription_limit
         self.prune_settings = prune_settings
         self.working: dict[str, _V2RayView] = {
@@ -479,7 +481,7 @@ class V2RayCatalog:
         self.failed: dict[str, _V2RayView] = {
             scheme: _V2RayView(db, scheme, "failed") for scheme in schemes
         }
-        self.enforce_max_working()
+        del max_working
         self.update_subscription()
 
     def enforce_max_working(self) -> int:
@@ -513,6 +515,14 @@ class V2RayCatalog:
                 limit=limit,
                 failed_limit=failed_limit,
             )
+            if (server := _server_from_row(row)).scheme in XRAY_SCHEMES
+            and is_nekoray_compatible(server)
+        ]
+
+    def due_servers(self, *, limit: int | None = None) -> list[V2RayServer]:
+        return [
+            server
+            for row in self.db.v2ray_due_probe_rows(limit=limit)
             if (server := _server_from_row(row)).scheme in XRAY_SCHEMES
             and is_nekoray_compatible(server)
         ]
@@ -551,7 +561,8 @@ class V2RayCatalog:
         ]
         added = self.db.v2ray_upsert_working(rows)
         if added:
-            self.enforce_max_working()
+            if self.catalog_max > 0:
+                self.db.v2ray_enforce_catalog_max(self.catalog_max)
             self.update_subscription()
         return added
 
@@ -564,12 +575,14 @@ class V2RayCatalog:
         ]
         added = self.db.v2ray_insert_new(rows)
         if added:
+            if self.catalog_max > 0:
+                self.db.v2ray_enforce_catalog_max(self.catalog_max)
             self.update_subscription()
         return added
 
     def apply_ping_results(self, results: Iterable) -> tuple[int, int]:
         """Persist ping outcomes with health counters; refresh subscription."""
-        outcomes = []
+        grouped: dict[str, list] = {}
         ok_n = 0
         fail_n = 0
         for result in results:
@@ -578,29 +591,34 @@ class V2RayCatalog:
                 continue
             # Never record "can't test with Xray" as a real probe failure.
             err = getattr(result, "error", None) or ""
+            err_l = err.lower()
             if not result.ok and (
-                "unsupported scheme" in err.lower()
-                or "invalid xray outbound" in err.lower()
+                "unsupported scheme" in err_l
+                or "invalid xray outbound" in err_l
+                or "outbound swap failed" in err_l
+                or "unavailable" in err_l
             ):
                 continue
             identity = server.as_db_row()
+            probe_type = str(getattr(result, "probe_type", "xray") or "xray")
             if result.ok and result.latency is not None:
-                outcomes.append((server.key, True, result.latency, None, identity))
+                grouped.setdefault(probe_type, []).append(
+                    (server.key, True, result.latency, None, identity)
+                )
                 ok_n += 1
             else:
-                outcomes.append(
-                    (
-                        server.key,
-                        False,
-                        None,
-                        err or None,
-                        identity,
-                    )
+                grouped.setdefault(probe_type, []).append(
+                    (server.key, False, None, err or None, identity)
                 )
                 fail_n += 1
-        self.db.v2ray_record_results(outcomes)
-        self.enforce_max_working()
+        for probe_type, outcomes in grouped.items():
+            tcp_flag = True if probe_type != "tcp" else None
+            self.db.v2ray_record_results(
+                outcomes, probe_type=probe_type, tcp_reachable=tcp_flag
+            )
         self.prune_stale()
+        if self.catalog_max > 0:
+            self.db.v2ray_enforce_catalog_max(self.catalog_max)
         self.update_subscription()
         return ok_n, fail_n
 
@@ -613,7 +631,8 @@ class V2RayCatalog:
             [server.as_db_row() for server in ok if server.scheme in self.working],
             [server.as_db_row() for server in failed if server.scheme in self.working],
         )
-        self.enforce_max_working()
+        if self.catalog_max > 0:
+            self.db.v2ray_enforce_catalog_max(self.catalog_max)
         self.update_subscription()
 
 def load_v2ray_from_text_file(path: Path) -> list[V2RayServer]:

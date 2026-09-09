@@ -193,7 +193,7 @@ class App:
         job_hints = {
             "scrape": "Collect MTProto / V2Ray proxies from Telegram channels.",
             "ping_mtproto": "Test MTProto servers and update the working catalog.",
-            "ping_v2ray": "Test V2Ray servers and update the working catalog.",
+            "ping_v2ray": "Test due V2Ray servers (TCP then Xray) and update the catalog.",
             "fetch_urls": "Fetch V2Ray servers from urls.txt (GitHub raw lists) into the catalog.",
         }
         for key in job_keys:
@@ -310,10 +310,10 @@ class App:
         ttk.Label(
             parent,
             text=(
-                "Run local SOCKS5 + HTTP proxy pairs (one upstream V2Ray server per slot) "
-                "from a single Xray process. Candidates are validated on a second Xray "
-                "process before ports 10801+ are updated. "
-                "Configure ports, rotation, and latency limits in Settings → Proxy pool."
+                "Run local SOCKS5 + HTTP slots from one never-restarted Xray. "
+                "SOCKS 10801+ and HTTP 11201+ stay bound; Rotate all flips balancer "
+                "targets only (existing TCP sessions do not migrate). "
+                "Failed slots are repaired from the standby ring automatically."
             ),
             wraplength=720,
         ).pack(anchor="w", pady=(0, 12))
@@ -342,6 +342,18 @@ class App:
             width=16,
         )
         self.pool_test_btn.pack(side="left", padx=(8, 0))
+        self.pool_rotate_btn = ttk.Button(
+            btn_row,
+            text="Rotate all",
+            command=self.rotate_proxy_pool,
+            width=16,
+        )
+        self.pool_rotate_btn.pack(side="left", padx=(8, 0))
+
+        self.pool_summary_var = tk.StringVar(value="Pool: stopped")
+        ttk.Label(parent, textvariable=self.pool_summary_var).pack(
+            anchor="w", pady=(0, 8)
+        )
 
         status_frame = ttk.LabelFrame(parent, text="Active proxies", padding=8)
         status_frame.pack(fill="both", expand=True)
@@ -743,6 +755,10 @@ class App:
 
         if key in {"scrape", "ping_v2ray"}:
             from fetch_mtproto.config_loader import config_int, load_config
+            from fetch_mtproto.v2ray.pool_ports import (
+                DEFAULT_PING_CONCURRENCY,
+                MAX_PING_CONCURRENCY,
+            )
             from fetch_mtproto.v2ray.port_cleanup import (
                 DEFAULT_PING_BASE_PORT,
                 cleanup_ping_xray,
@@ -750,7 +766,7 @@ class App:
 
             config = load_config(required=False)
             base = DEFAULT_PING_BASE_PORT
-            concurrency = 64
+            concurrency = DEFAULT_PING_CONCURRENCY
             if config is not None:
                 base = config_int(
                     getattr(config, "V2RAY_PING_BASE_PORT", None),
@@ -760,12 +776,10 @@ class App:
                 )
                 concurrency = config_int(
                     getattr(config, "V2RAY_PING_CONCURRENCY", None),
-                    20,
+                    DEFAULT_PING_CONCURRENCY,
                     minimum=1,
-                    maximum=64,
+                    maximum=MAX_PING_CONCURRENCY,
                 )
-                # Clear the full allowed window in case concurrency was higher before.
-                concurrency = max(concurrency, 64)
             try:
                 killed = cleanup_ping_xray(base_port=base, concurrency=concurrency)
             except Exception as exc:
@@ -1139,27 +1153,55 @@ class App:
     def start_proxy_pool(self, *, is_restart: bool = False) -> None:
         from fetch_mtproto.config_loader import load_config
         from fetch_mtproto.v2ray.ping import resolve_xray_bin
+        from fetch_mtproto.v2ray.pool_ports import (
+            DEFAULT_HTTP_START_PORT,
+            DEFAULT_POOL_API_PORT,
+            clamp_pool_count,
+            last_pool_ports,
+        )
 
         if self.proxy_pool is not None and self.proxy_pool.running:
             self.log_line("[proxy pool] already running")
             return
 
+        def _int_setting(section: str, key: str, default: int) -> int:
+            try:
+                return int(self.settings.var(section, key).get())
+            except (tk.TclError, KeyError, TypeError, ValueError):
+                return default
+
         try:
-            start_port = max(1024, int(self.settings.var("proxy_pool", "start_port").get()))
-            count = max(1, min(50, int(self.settings.var("proxy_pool", "count").get())))
-            switch_sec = max(
-                30, int(self.settings.var("proxy_pool", "switch_interval_sec").get())
+            start_port = max(
+                1024, int(self.settings.var("proxy_pool", "start_port").get())
             )
-            reuse_rotations = max(
-                1, int(self.settings.var("proxy_pool", "reuse_after_rotations").get())
+            count = clamp_pool_count(
+                int(self.settings.var("proxy_pool", "count").get())
+            )
+            http_start = max(
+                1024,
+                _int_setting("proxy_pool", "http_start_port", DEFAULT_HTTP_START_PORT),
+            )
+            api_port = max(
+                1024,
+                _int_setting("proxy_pool", "xray_api_port", DEFAULT_POOL_API_PORT),
             )
             reuse_sec = max(
-                60, int(self.settings.var("proxy_pool", "reuse_after_sec").get())
+                1, int(self.settings.var("proxy_pool", "reuse_after_sec").get())
+            )
+            reuse_sec = max(
+                1, _int_setting("proxy_pool", "min_reuse_sec", reuse_sec) or reuse_sec
             )
             max_latency_ms = max(
                 100, int(self.settings.var("proxy_pool", "max_latency_ms").get())
             )
             random_pick = bool(self.settings.var("proxy_pool", "random").get())
+            standby = _int_setting("proxy_pool", "standby_outbounds", 300)
+            reserve = _int_setting("proxy_pool", "reserve_outbounds", 100)
+            diversity = max(
+                0, _int_setting("proxy_pool", "diversity_rotate_sec", 0)
+            )
+            hot_refresh = max(2, _int_setting("hot_set", "refresh_sec", 10))
+            freshness = max(60, _int_setting("hot_set", "freshness_sec", 900))
         except tk.TclError:
             if not is_restart:
                 messagebox.showerror("fetch-mtproto", "Invalid proxy pool settings.")
@@ -1170,11 +1212,11 @@ class App:
             self._schedule_proxy_pool_restart()
             return
 
-        last_port = ProxyPoolRunner.last_port(start_port, count)
-        if last_port > 65535:
+        last_socks, last_http = last_pool_ports(start_port, http_start, count)
+        if last_socks > 65535 or last_http > 65535:
             msg = (
-                f"Port range {start_port}–{last_port} exceeds 65535 "
-                f"(each slot uses SOCKS5 + HTTP on two consecutive ports)."
+                f"Port range exceeds 65535 "
+                f"(SOCKS {start_port}–{last_socks}, HTTP {http_start}–{last_http})."
             )
             if not is_restart:
                 messagebox.showerror("fetch-mtproto", msg)
@@ -1208,14 +1250,21 @@ class App:
         self.proxy_pool = ProxyPoolRunner(
             start_port=start_port,
             count=count,
-            switch_interval_sec=float(switch_sec),
+            switch_interval_sec=float(diversity),
             xray_bin=xray_bin,
-            reuse_after_rotations=reuse_rotations,
+            reuse_after_rotations=1,
             reuse_after_sec=float(reuse_sec),
             max_latency_ms=float(max_latency_ms),
             random_pick=random_pick,
+            http_start_port=http_start,
+            api_port=api_port,
+            standby_outbounds=standby,
+            reserve_outbounds=reserve,
+            hot_refresh_sec=float(hot_refresh),
+            freshness_sec=float(freshness),
+            diversity_rotate_sec=float(diversity),
             log=self.log_line,
-            on_status=self._update_proxy_pool_status,
+            on_snapshot=self._update_proxy_pool_snapshot,
             on_finished=self._proxy_pool_finished,
         )
         self.proxy_pool.start()
@@ -1225,9 +1274,9 @@ class App:
         mode = "random" if random_pick else "fastest-first"
         verb = "re-starting" if is_restart else "starting"
         self.log_line(
-            f"[proxy pool] {verb} {count} slot(s): SOCKS5+HTTP on ports "
-            f"{start_port}–{last_port} (switch every {switch_sec}s, "
-            f"{mode} ≤{max_latency_ms} ms)"
+            f"[proxy pool] {verb} {count} slot(s): SOCKS {start_port}–{last_socks}, "
+            f"HTTP {http_start}–{last_http}, api {api_port} "
+            f"({mode} ≤{max_latency_ms} ms, routing-only rotate)"
         )
         if not is_restart:
             self.notebook.select(self.proxy_pool_tab)
@@ -1307,6 +1356,16 @@ class App:
 
         self.root.after(0, finish)
 
+    def rotate_proxy_pool(self) -> None:
+        if self.proxy_pool is None or not self.proxy_pool.running:
+            messagebox.showinfo(
+                "fetch-mtproto",
+                "Start the proxy pool first, then click Rotate all.",
+            )
+            return
+        self.proxy_pool.request_rotate_all()
+        self.log_line("[proxy pool] rotate-all requested (routing override only)")
+
     def stop_proxy_pool(self) -> None:
         self._proxy_pool_want_running = False
         self._cancel_proxy_pool_restart()
@@ -1317,6 +1376,7 @@ class App:
             self.pool_test_btn.configure(state="normal")
             self.settings.set_pool_inputs_enabled(True)
             self._update_proxy_pool_status([])
+            self.pool_summary_var.set("Pool: stopped")
             self.log_line("[proxy pool] restart cancelled")
             return
         pool = self.proxy_pool
@@ -1337,36 +1397,64 @@ class App:
             self.log_line(f"[proxy pool] stop failed: {exc}")
             self.root.after(0, self._proxy_pool_finished)
 
+    def _pool_row_values(self, index: int, item) -> tuple:
+        latency = (
+            f"{item.latency_ms:.0f} ms" if item.latency_ms is not None else "—"
+        )
+        if item.error:
+            state = f"error: {item.error}"
+        elif item.running:
+            state = "running"
+        else:
+            state = "stopped"
+        return (
+            str(index),
+            f"socks5://127.0.0.1:{item.socks_port}",
+            f"http://127.0.0.1:{item.http_port}",
+            item.host,
+            item.scheme,
+            latency,
+            item.upload_text,
+            item.download_text,
+            state,
+        )
+
     def _update_proxy_pool_status(self, statuses) -> None:
         def apply() -> None:
-            self.pool_tree.delete(*self.pool_tree.get_children())
+            wanted: list[str] = []
+            existing = set(self.pool_tree.get_children())
             for index, item in enumerate(statuses, start=1):
-                latency = (
-                    f"{item.latency_ms:.0f} ms"
-                    if item.latency_ms is not None
-                    else "—"
-                )
-                if item.error:
-                    state = f"error: {item.error}"
-                elif item.running:
-                    state = "running"
+                iid = str(index)
+                wanted.append(iid)
+                values = self._pool_row_values(index, item)
+                if iid in existing:
+                    if tuple(self.pool_tree.item(iid, "values")) != values:
+                        self.pool_tree.item(iid, values=values)
                 else:
-                    state = "stopped"
-                self.pool_tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        index,
-                        f"socks5://127.0.0.1:{item.socks_port}",
-                        f"http://127.0.0.1:{item.http_port}",
-                        item.host,
-                        item.scheme,
-                        latency,
-                        item.upload_text,
-                        item.download_text,
-                        state,
-                    ),
-                )
+                    self.pool_tree.insert("", "end", iid=iid, values=values)
+            wanted_set = set(wanted)
+            for iid in existing:
+                if iid not in wanted_set:
+                    self.pool_tree.delete(iid)
+            if not statuses:
+                self.pool_summary_var.set("Pool: stopped")
+
+        self.root.after(0, apply)
+
+    def _update_proxy_pool_snapshot(self, snapshot) -> None:
+        avg = (
+            f"{snapshot.average_latency:.0f} ms"
+            if snapshot.average_latency is not None
+            else "—"
+        )
+        text = (
+            f"Pool slots {snapshot.total} · assigned {snapshot.healthy} · "
+            f"dead {snapshot.dead} · avg {avg}"
+        )
+
+        def apply() -> None:
+            self.pool_summary_var.set(text)
+            self._update_proxy_pool_status(snapshot.slots)
 
         self.root.after(0, apply)
 
@@ -1424,6 +1512,7 @@ class App:
             self.pool_test_btn.configure(state="normal")
             self.settings.set_pool_inputs_enabled(True)
             self._update_proxy_pool_status([])
+            self.pool_summary_var.set("Pool: stopped")
 
         self.root.after(0, apply)
 
@@ -1506,11 +1595,14 @@ class App:
                 db.close()
             mt_avg = f", ~{mt_h['avg_ok_ms']:.0f}ms" if mt_h["avg_ok_ms"] else ""
             v2_avg = f", ~{v2_h['avg_ok_ms']:.0f}ms" if v2_h["avg_ok_ms"] else ""
+            assigned = v2_h.get("assigned", 0)
+            if self.proxy_pool is not None and self.proxy_pool.running:
+                assigned = sum(1 for s in self.proxy_pool.snapshot_statuses() if s.running)
             text = (
-                f"MTProto {mt_h['working']}/{mt_h['total']} ok "
-                f"(Σ✓{mt_h['successes']} Σ✗{mt_h['failures']}{mt_avg}) · "
-                f"V2Ray {v2_h['working']}/{v2_h['total']} ok "
-                f"(Σ✓{v2_h['successes']} Σ✗{v2_h['failures']}{v2_avg})"
+                f"MTProto {mt_h['working']}/{mt_h['total']} ok{mt_avg} · "
+                f"V2Ray inv {v2_h['total']} healthy {v2_h.get('healthy', 0)} "
+                f"hot {v2_h.get('hot', 0)} assigned {assigned}"
+                f"{v2_avg}"
             )
         except Exception as exc:
             text = f"status error: {exc}"
@@ -1555,6 +1647,8 @@ class App:
             self.root.after(200, lambda: self.start_job("serve"))
         if bool(getattr(config, "GUI_AUTO_START_PROXY_POOL", False)):
             self.root.after(300, self.start_proxy_pool)
+        if bool(getattr(config, "GUI_AUTO_START_PING_V2RAY", False)):
+            self.root.after(400, lambda: self.start_job("ping_v2ray"))
 
     def run(self) -> None:
         self.log_line("fetch-mtproto control panel ready.")

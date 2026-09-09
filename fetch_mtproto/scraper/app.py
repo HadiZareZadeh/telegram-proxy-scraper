@@ -382,8 +382,7 @@ async def periodic_checks(
                 )
 
                 log.info(
-                    "Scheduled V2Ray check (%d unique, full catalog) via %s …",
-                    len(v2_catalog.all_unique()),
+                    "Scheduled V2Ray check (due-queue, not full catalog) via %s …",
                     v2_kwargs["test_url"],
                 )
                 if not v2_kwargs["xray_bin"]:

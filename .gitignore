@@ -25,6 +25,9 @@ geosite.dat
 bin/xray.exe
 bin/xray
 
+# Downloaded Xray proto sources (compiled stubs live in-tree)
+.proto_tmp/
+
 # Python
 __pycache__/
 *.py[cod]

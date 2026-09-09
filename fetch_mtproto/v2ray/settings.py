@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from fetch_mtproto.config_loader import config_float
+from fetch_mtproto.config_loader import config_float, config_int
 from fetch_mtproto.v2ray.ping import (
     DEFAULT_PING_CONCURRENCY,
+    DEFAULT_TCP_CONCURRENCY,
+    DEFAULT_TCP_TIMEOUT,
     DEFAULT_TEST_BYTES,
     DEFAULT_TEST_TIMEOUT,
     DEFAULT_TEST_URL,
     clamp_ping_concurrency,
     resolve_xray_bin,
 )
-from fetch_mtproto.v2ray.port_cleanup import DEFAULT_PING_BASE_PORT
+from fetch_mtproto.v2ray.pool_ports import DEFAULT_PING_BASE_PORT
 
 
 def v2ray_test_kwargs(config) -> dict:
@@ -38,6 +40,16 @@ def v2ray_test_kwargs(config) -> dict:
         "test_url": str(getattr(config, "V2RAY_TEST_URL", DEFAULT_TEST_URL)),
         "test_bytes": int(getattr(config, "V2RAY_TEST_BYTES", DEFAULT_TEST_BYTES)),
         "xray_bin": resolve_xray_bin(getattr(config, "XRAY_BIN", None)),
+        "tcp_concurrency": config_int(
+            getattr(config, "V2RAY_TCP_CONCURRENCY", None),
+            DEFAULT_TCP_CONCURRENCY,
+            minimum=1,
+            maximum=4000,
+        ),
+        "tcp_timeout": config_float(
+            getattr(config, "V2RAY_TCP_TIMEOUT", None), DEFAULT_TCP_TIMEOUT
+        ),
+        "due_only": True,
     }
 
 

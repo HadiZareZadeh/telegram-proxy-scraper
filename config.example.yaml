@@ -46,15 +46,19 @@ v2ray:
   # Set test_bytes > 0 only if you want to also read that many body bytes.
   test_url: http://www.gstatic.com/generate_204
   test_bytes: 0
-  test_timeout: 8.0
-  # Servers probed in parallel on one long-lived Ping Xray (local SOCKS ports + Handler API)
-  ping_concurrency: 20
-  # Local SOCKS ports for Ping V2Ray: base .. base+concurrency-1 (API at base+concurrency)
-  # Kept far from proxy_pool.start_port so leftovers can be killed by range.
+  test_timeout: 2.5
+  # Parallel Xray probe slots (gRPC outbound swap on one probe process)
+  ping_concurrency: 256
+  tcp_concurrency: 500
+  tcp_timeout: 1.25
+  # Local SOCKS ports for Ping V2Ray: 45001 .. 45001+concurrency-1 (API at 45520)
   ping_base_port: 45001
-  # Cap working set size after a full-catalog probe (0 = unlimited)
-  max_working: 300
+  # Inventory cap: prune only chronic dead when over this (0 = unlimited)
+  catalog_max: 50000
+  # Unused for V2Ray (healthy rows are never demoted just for ranking)
+  max_working: 0
   # Fastest, most recently checked working servers exported to subscription.txt (0 = unlimited)
+  # This is a query/export limit, not a catalog cap.
   subscription_limit: 100
   # Expand HTTP subscription URLs and inline Base64 blobs into individual share links
   expand_subscriptions: true
@@ -67,7 +71,7 @@ v2ray:
   decrypt_npvt_attachments: true
 
 scraper:
-  # Pause between re-ping runs (seconds; starts after each check finishes; 0 = disabled)
+  # Pause between re-ping runs (seconds; V2Ray only probes rows whose probe_due_at is due)
   proxy_check_interval: 300
   # Pause before reconnecting after a dropped Telegram connection (seconds)
   reconnect_delay: 5
@@ -90,7 +94,7 @@ mtproto:
 
 probe:
   # Adaptive probe scheduler for MTProto (explore / exploit / recover)
-  # V2Ray Ping always probes the full catalog on one shared Xray process.
+  # V2Ray Ping uses probe_due_at (unknown now, healthy 5–15m, degraded 2m, dead backoff).
   # Skip chronic MTProto failures until their backoff window expires.
   respect_backoff: true
   # Drop dead servers so ping runs stay fast (applied after each check + at startup)
@@ -102,19 +106,34 @@ probe:
   prune_incompatible_v2ray: true  # delete xhttp / splithttp / raw (Nekoray-incompatible)
 
 proxy_pool:
-  # Local SOCKS5+HTTP slots for emulators / other tools (Proxy pool tab).
-  # All slots share one Xray process; validation uses a second process on 44001+.
+  # Local SOCKS5 + HTTP slots (one never-restarted Xray). Slot 0 SOCKS stays 10801.
+  # HTTP is a separate range. Rotation is OverrideBalancerTarget (existing TCP sessions stay).
   start_port: 10801
-  count: 10
-  # Rotate upstream V2Ray servers for every slot
-  switch_interval_sec: 30
-  # Do not reuse an upstream until either threshold is met
-  reuse_after_rotations: 5
-  reuse_after_sec: 1200
-  # Working servers at or below this latency (ms) are eligible
-  max_latency_ms: 2000
-  # true = shuffle eligible servers each round; false = fastest-first
+  socks_start_port: 10801
+  http_start_port: 11201
+  xray_api_port: 20802
+  stats_port: 20802
+  count: 300
+  standby_outbounds: 300
+  reserve_outbounds: 100
+  # Optional timed shuffle of healthy slots (0 = off; failed slots are replaced automatically)
+  diversity_rotate_sec: 0
+  switch_interval_sec: 0
+  reuse_after_rotations: 1
+  reuse_after_sec: 600
+  min_reuse_sec: 600
+  rotate_mode: assignment
+  rotate_existing_connections: false
+  # Working servers at or below this latency (ms) are eligible for the hot ring
+  max_latency_ms: 3000
+  # true = shuffle eligible servers each assignment; false = fastest-first
   random: true
+
+hot_set:
+  size: 1500
+  refresh_sec: 10
+  max_latency_ms: 3000
+  freshness_sec: 900
 
 gui:
   # When using app.pyw, start these jobs automatically after the control panel opens

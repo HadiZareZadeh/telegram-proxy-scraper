@@ -64,7 +64,10 @@ def ping_live_slots(base_port: int, concurrency: int) -> list[LiveSlotSpec]:
 
 
 def ping_api_port(base_port: int, concurrency: int) -> int:
-    return int(base_port) + max(1, int(concurrency))
+    from fetch_mtproto.v2ray.pool_ports import DEFAULT_PING_API_PORT
+
+    del base_port, concurrency
+    return DEFAULT_PING_API_PORT
 
 
 def pool_test_live_slot(base_port: int) -> LiveSlotSpec:
@@ -86,7 +89,7 @@ def _port_is_open(host: str, port: int, *, timeout: float = 0.2) -> bool:
 
 
 class XrayLiveSession:
-    """One Xray process; swap outbound tags via `xray api rmo` / `ado`."""
+    """One Xray process; swap outbound tags via HandlerService gRPC."""
 
     def __init__(
         self,
@@ -106,6 +109,8 @@ class XrayLiveSession:
         self._cfg_path: str | None = None
         self._tags = [slot.tag for slot in self.slots]
         self._tag_index = {slot.tag: index for index, slot in enumerate(self.slots)}
+        self._control = None
+        self._handler = None
 
     @property
     def running(self) -> bool:
@@ -132,13 +137,21 @@ class XrayLiveSession:
             self._cfg_path = handle.name
 
         try:
+            err_path = Path(self._cfg_path).with_suffix(".err")
+            self._err_file = open(err_path, "w", encoding="utf-8")
             self._proc = subprocess.Popen(
                 [self.bin_path, "run", "-c", self._cfg_path],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=self._err_file,
                 **hide_console_kwargs(),
             )
         except OSError:
+            if getattr(self, "_err_file", None) is not None:
+                try:
+                    self._err_file.close()
+                except Exception:
+                    pass
+                self._err_file = None
             self._cleanup_cfg()
             raise
 
@@ -151,6 +164,8 @@ class XrayLiveSession:
     def stop(self) -> None:
         proc = self._proc
         self._proc = None
+        err_file = getattr(self, "_err_file", None)
+        self._err_file = None
         if proc is not None and proc.poll() is None:
             try:
                 kill_pid_tree(proc.pid, timeout=3.0)
@@ -163,103 +178,69 @@ class XrayLiveSession:
                 proc.wait(timeout=3.0)
             except Exception:
                 pass
+        if err_file is not None:
+            try:
+                err_file.close()
+            except Exception:
+                pass
         self._cleanup_cfg()
 
     def set_slot_outbound(self, index: int, outbound: dict[str, Any] | None) -> None:
-        if index < 0 or index >= len(self.slots):
-            raise IndexError(f"slot index out of range: {index}")
-        tag = self.slots[index].tag
-        payload = blackhole_outbound(tag) if outbound is None else dict(outbound)
-        payload["tag"] = tag
-        self._replace_outbound(tag, payload)
+        raise RuntimeError("use set_outbounds_async — CLI Handler API is removed")
 
     def set_outbounds(
         self, outbounds: list[dict[str, Any] | None]
     ) -> list[str | None]:
-        """Replace slots; return per-slot error (None = ok). Bad slots become blackhole."""
+        raise RuntimeError("use set_outbounds_async — CLI Handler API is removed")
+
+    async def connect_control(self) -> None:
+        from fetch_mtproto.v2ray.xray_control import HandlerClient, XrayControlChannel
+
+        if self._control is not None:
+            return
+        control = XrayControlChannel(port=self.api_port)
+        await control.connect()
+        self._control = control
+        self._handler = HandlerClient(control)
+
+    async def close_control(self) -> None:
+        control = self._control
+        self._control = None
+        self._handler = None
+        if control is not None:
+            await control.close()
+
+    async def set_outbounds_async(
+        self, outbounds: list[dict[str, Any] | None]
+    ) -> list[str | None]:
+        """Replace slot outbounds in parallel via HandlerService gRPC."""
+        import asyncio
+
         if len(outbounds) > len(self.slots):
             raise ValueError(
                 f"too many outbounds ({len(outbounds)}) for {len(self.slots)} slots"
             )
+        await self.connect_control()
+        handler = self._handler
+        assert handler is not None
         errors: list[str | None] = [None] * len(self.slots)
-        for index in range(len(self.slots)):
+
+        async def _one(index: int) -> None:
             outbound = outbounds[index] if index < len(outbounds) else None
+            tag = self.slots[index].tag
+            payload = blackhole_outbound(tag) if outbound is None else dict(outbound)
+            payload["tag"] = tag
             try:
-                self.set_slot_outbound(index, outbound)
+                await handler.replace_outbound(payload, tag=tag)
             except Exception as exc:
-                detail = str(exc) or type(exc).__name__
-                errors[index] = detail
+                errors[index] = str(exc) or type(exc).__name__
                 try:
-                    self.set_slot_outbound(index, None)
+                    await handler.replace_outbound(blackhole_outbound(tag), tag=tag)
                 except Exception:
                     pass
+
+        await asyncio.gather(*(_one(i) for i in range(len(self.slots))))
         return errors
-
-    def _replace_outbound(self, tag: str, outbound: dict[str, Any]) -> None:
-        if not self.running:
-            raise RuntimeError("Xray live session is not running")
-        last_error = ""
-        for attempt in range(4):
-            self._api_rmo(tag)
-            if attempt:
-                time.sleep(0.05 * attempt)
-            err = self._api_ado(outbound)
-            if err is None:
-                return
-            last_error = err
-            time.sleep(0.08 * (attempt + 1))
-        # Keep a placeholder outbound so routing still has a valid tag.
-        self._api_rmo(tag)
-        self._api_ado(blackhole_outbound(tag))
-        raise RuntimeError(f"failed to set outbound {tag!r}: {last_error}")
-
-    def _api_rmo(self, tag: str) -> None:
-        # Removal of a missing tag is fine (first swap / already cleared).
-        self._run_api(["rmo", f"--server=127.0.0.1:{self.api_port}", tag])
-
-    def _api_ado(self, outbound: dict[str, Any]) -> str | None:
-        path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                suffix=".json",
-                delete=False,
-                prefix=f"{self.prefix}-ado-",
-            ) as handle:
-                # CLI expects a config fragment: {"outbounds": [ ... ]}
-                json.dump({"outbounds": [outbound]}, handle, ensure_ascii=False)
-                path = handle.name
-            code, stdout, stderr = self._run_api(
-                ["ado", f"--server=127.0.0.1:{self.api_port}", path]
-            )
-            if code == 0:
-                return None
-            detail = (stderr or stdout or "").strip()
-            return detail or f"ado failed (code {code})"
-        finally:
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-
-    def _run_api(self, args: list[str]) -> tuple[int, str, str]:
-        try:
-            result = subprocess.run(
-                [self.bin_path, "api", *args],
-                capture_output=True,
-                text=True,
-                timeout=5.0,
-                **hide_console_kwargs(),
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return 1, "", str(exc)
-        return (
-            int(result.returncode),
-            result.stdout or "",
-            result.stderr or "",
-        )
 
     def _wait_ready(self, *, timeout: float) -> None:
         ports: list[int] = [self.api_port]

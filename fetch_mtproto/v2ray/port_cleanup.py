@@ -1,4 +1,4 @@
-"""Kill leftover Xray listeners on dedicated Ping / Proxy-pool port ranges."""
+"""Kill leftover Xray listeners on Ping / Proxy-pool port ranges."""
 
 from __future__ import annotations
 
@@ -11,70 +11,57 @@ import time
 from typing import Iterable
 
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_pid_tree
+from fetch_mtproto.v2ray.pool_ports import (
+    DEFAULT_HTTP_START_PORT,
+    DEFAULT_PING_API_PORT,
+    DEFAULT_PING_BASE_PORT,
+    DEFAULT_PING_CONCURRENCY,
+    DEFAULT_POOL_API_PORT,
+    DEFAULT_POOL_COUNT,
+    DEFAULT_SOCKS_START_PORT,
+    MAX_PING_CONCURRENCY,
+    ping_socks_ports,
+    pool_listen_ports,
+)
 
-# Proxy pool keeps 10801+ (Memu / emulators). Ping / pool-test use separate ranges.
-DEFAULT_PING_BASE_PORT = 45001
-DEFAULT_POOL_START_PORT = 10801
-DEFAULT_POOL_COUNT = 10
+# Kept for older imports.
+DEFAULT_POOL_START_PORT = DEFAULT_SOCKS_START_PORT
 DEFAULT_POOL_TEST_BASE_PORT = 44001
-PORTS_PER_POOL_SLOT = 2
-# Single Stats API for the shared pool Xray process.
-POOL_API_PORT_OFFSET = 10000
-# SOCKS + HTTP + Handler API for the long-lived pool validation Xray.
-PORTS_PER_POOL_TEST = 3
+PORTS_PER_POOL_SLOT = 1
+POOL_API_PORT_OFFSET = 10001
+PORTS_PER_POOL_TEST = 0
 
 _XRAY_NAMES = frozenset({"xray", "xray.exe"})
 
 
 def ping_ports(base_port: int, concurrency: int) -> list[int]:
-    """Local SOCKS ports + Handler API for one long-lived Ping Xray process."""
-    base = max(1024, int(base_port))
-    count = max(1, int(concurrency))
-    api = base + count
-    last = api
-    if last > 65535:
-        raise ValueError(
-            f"Ping port range {base}–{last} exceeds 65535 "
-            f"(base={base}, concurrency={count})"
-        )
-    return list(range(base, base + count)) + [api]
+    socks = ping_socks_ports(base_port, concurrency)
+    api = DEFAULT_PING_API_PORT
+    if api in socks:
+        api = max(socks) + 1
+    return socks + [api]
 
 
 def pool_test_ports(base_port: int = DEFAULT_POOL_TEST_BASE_PORT) -> list[int]:
-    """SOCKS + HTTP + Handler API for the proxy-pool validation Xray process."""
-    base = max(1024, int(base_port))
-    last = base + PORTS_PER_POOL_TEST - 1
-    if last > 65535:
-        raise ValueError(f"Proxy pool test ports exceed 65535 (base={base})")
-    return list(range(base, base + PORTS_PER_POOL_TEST))
+    return []
 
 
-def pool_ports(start_port: int, count: int) -> list[int]:
-    """SOCKS + HTTP per slot + one shared stats API + pool-test ports."""
-    start = max(1024, int(start_port))
-    slots = max(1, int(count))
-    ports: list[int] = []
-    for index in range(slots):
-        socks = start + index * PORTS_PER_POOL_SLOT
-        http = socks + 1
-        if http > 65535:
-            raise ValueError(
-                f"Proxy pool ports exceed 65535 (start={start}, count={slots})"
-            )
-        ports.extend((socks, http))
-    api = start + POOL_API_PORT_OFFSET
-    if api > 65535:
-        raise ValueError(
-            f"Proxy pool API port exceeds 65535 "
-            f"(start={start}, offset={POOL_API_PORT_OFFSET})"
-        )
-    ports.append(api)
-    ports.extend(pool_test_ports())
-    return ports
+def pool_ports(
+    start_port: int,
+    count: int,
+    *,
+    http_start: int | None = None,
+    api_port: int | None = None,
+) -> list[int]:
+    socks = max(1024, int(start_port))
+    http = int(http_start) if http_start else DEFAULT_HTTP_START_PORT
+    api = int(api_port) if api_port else DEFAULT_POOL_API_PORT
+    return pool_listen_ports(
+        socks_start=socks, http_start=http, count=count, api_port=api
+    )
 
 
 def _listening_pids_windows(ports: set[int]) -> dict[int, set[int]]:
-    """Map pid -> ports it is LISTENING on (subset of `ports`)."""
     try:
         result = subprocess.run(
             ["netstat", "-ano", "-p", "tcp"],
@@ -89,7 +76,6 @@ def _listening_pids_windows(ports: set[int]) -> dict[int, set[int]]:
         return {}
 
     by_pid: dict[int, set[int]] = {}
-    # TCP    127.0.0.1:10801    0.0.0.0:0    LISTENING    1234
     line_re = re.compile(
         r"^\s*TCP\s+(\S+):(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$",
         re.IGNORECASE,
@@ -119,7 +105,6 @@ def _listening_pids_unix(ports: set[int]) -> dict[int, set[int]]:
         )
     except (OSError, subprocess.TimeoutExpired):
         return {}
-    # ... 127.0.0.1:45001 ... users:(("xray",pid=123,fd=8))
     for line in result.stdout.splitlines():
         port_match = re.search(r":(\d+)\s", line)
         if not port_match:
@@ -165,7 +150,6 @@ def _image_name(pid: int) -> str | None:
         line = (result.stdout or "").strip().splitlines()
         if not line:
             return None
-        # "xray.exe","1234","Session","1","12 K"
         parts = next(iter(line)).split(",")
         if not parts:
             return None
@@ -191,10 +175,6 @@ def is_xray_pid(pid: int) -> bool:
 
 
 def kill_xray_on_ports(ports: Iterable[int]) -> list[int]:
-    """
-    Kill Xray processes listening on any of the given ports.
-    Returns the list of PIDs that were targeted.
-    """
     by_pid = listening_pids_on_ports(ports)
     killed: list[int] = []
     for pid in sorted(by_pid):
@@ -206,10 +186,6 @@ def kill_xray_on_ports(ports: Iterable[int]) -> list[int]:
 
 
 def kill_listeners_on_ports(ports: Iterable[int]) -> list[int]:
-    """
-    Kill any process listening on the given ports (not limited to Xray).
-    Skips this process. Returns the list of PIDs that were targeted.
-    """
     self_pid = os.getpid()
     by_pid = listening_pids_on_ports(ports)
     killed: list[int] = []
@@ -222,7 +198,6 @@ def kill_listeners_on_ports(ports: Iterable[int]) -> list[int]:
 
 
 def cleanup_subscription_port(port: int) -> list[int]:
-    """Free the subscription HTTP bind port if a leftover process holds it."""
     port = int(port)
     if port <= 0 or port > 65535:
         return []
@@ -243,7 +218,6 @@ def wait_ping_ports_free(
     concurrency: int,
     timeout: float = 5.0,
 ) -> None:
-    """Block until ping SOCKS ports are not held by a leftover Xray listener."""
     ports = ping_ports(base_port, concurrency)
     deadline = time.monotonic() + max(0.1, float(timeout))
     while time.monotonic() < deadline:
@@ -264,29 +238,46 @@ def cleanup_ping_xray(*, base_port: int, concurrency: int) -> list[int]:
     return kill_xray_on_ports(ping_ports(base_port, concurrency))
 
 
-def cleanup_pool_xray(*, start_port: int, count: int) -> list[int]:
-    return kill_xray_on_ports(pool_ports(start_port, count))
+def cleanup_pool_xray(
+    *,
+    start_port: int,
+    count: int,
+    http_start: int | None = None,
+    api_port: int | None = None,
+) -> list[int]:
+    return kill_xray_on_ports(
+        pool_ports(start_port, count, http_start=http_start, api_port=api_port)
+    )
 
 
 def cleanup_owned_xray_from_config(config) -> dict[str, list[int]]:
-    """Clear both Ping and Proxy-pool port ranges (safe at app startup)."""
     ping_base = int(
         getattr(config, "V2RAY_PING_BASE_PORT", DEFAULT_PING_BASE_PORT)
         or DEFAULT_PING_BASE_PORT
     )
-    concurrency = 64  # full allowed ping batch window
+    concurrency = int(
+        getattr(config, "V2RAY_PING_CONCURRENCY", DEFAULT_PING_CONCURRENCY)
+        or DEFAULT_PING_CONCURRENCY
+    )
+    concurrency = max(concurrency, MAX_PING_CONCURRENCY)
 
-    pool_start = int(
-        getattr(config, "PROXY_POOL_START_PORT", DEFAULT_POOL_START_PORT)
-        or DEFAULT_POOL_START_PORT
+    socks = int(
+        getattr(config, "PROXY_POOL_SOCKS_START_PORT", None)
+        or getattr(config, "PROXY_POOL_START_PORT", DEFAULT_SOCKS_START_PORT)
+        or DEFAULT_SOCKS_START_PORT
+    )
+    http = int(
+        getattr(config, "PROXY_POOL_HTTP_START_PORT", None) or DEFAULT_HTTP_START_PORT
     )
     pool_count = int(
         getattr(config, "PROXY_POOL_COUNT", DEFAULT_POOL_COUNT) or DEFAULT_POOL_COUNT
     )
-    # Clear a slightly wider pool window in case count was raised before.
-    pool_count = max(pool_count, 50)
-
+    api = int(
+        getattr(config, "PROXY_POOL_XRAY_API_PORT", None) or DEFAULT_POOL_API_PORT
+    )
     return {
         "ping": cleanup_ping_xray(base_port=ping_base, concurrency=concurrency),
-        "pool": cleanup_pool_xray(start_port=pool_start, count=pool_count),
+        "pool": cleanup_pool_xray(
+            start_port=socks, count=pool_count, http_start=http, api_port=api
+        ),
     }
