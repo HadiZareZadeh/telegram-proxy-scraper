@@ -147,6 +147,8 @@ hot_set:
   freshness_sec: 900
 
 gui:
+  # light or dark — restyles the whole control panel
+  theme: dark
   # When using app.pyw, start these jobs automatically after the control panel opens
   auto_start_scraper: true
   auto_start_subscription_server: true

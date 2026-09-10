@@ -17,6 +17,7 @@ from fetch_mtproto.cancel import CANCEL_ENV
 from fetch_mtproto.paths import LOGS_DIR, PROJECT_ROOT
 from fetch_mtproto.process_tree import hide_console_kwargs, kill_process_tree
 from fetch_mtproto.gui.settings_panel import ConfigSettingsPanel
+from fetch_mtproto.gui.theme import apply_theme, normalize_theme, palette_for, style_menu
 from fetch_mtproto.v2ray.proxy_pool import ProxyPoolRunner
 
 TELEGRAM_EXE = os.path.join(
@@ -102,6 +103,8 @@ class App:
         self.proxy_pool: "ProxyPoolRunner | None" = None
         self._config_save_after_id: str | None = None
         self._loading_config = False
+        self._applying_theme = False
+        self._theme_palette = palette_for("dark")
         self._proxy_pool_testing = False
         self._proxy_pool_want_running = False
         self._proxy_pool_restart_attempt = 0
@@ -109,8 +112,10 @@ class App:
         self._proxy_pool_started_at: float | None = None
 
         self.settings = ConfigSettingsPanel(self)
+        self._watch_theme_var()
         self._build_ui()
         self._load_ui_from_config()
+        self._apply_theme()
         self.root.after(100, self._drain_log_queue)
         self.root.after(300, self.refresh_status)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -147,6 +152,17 @@ class App:
         status_label = ttk.Label(bar, textvariable=self.status_var)
         status_label.pack(side="right", padx=12)
         self._attach_status_menu(status_label)
+
+        ttk.Label(bar, text="Theme").pack(side="left")
+        self.theme_var = self.settings.var("gui", "theme")
+        theme_combo = ttk.Combobox(
+            bar,
+            textvariable=self.theme_var,
+            values=("dark", "light"),
+            state="readonly",
+            width=8,
+        )
+        theme_combo.pack(side="left", padx=(6, 0))
 
     def _build_notebook(self, parent: ttk.Frame) -> None:
         notebook = ttk.Notebook(parent)
@@ -252,7 +268,7 @@ class App:
         self.sub_placeholder = ttk.Label(
             sub_left,
             text="Start the subscription server to see URLs and a QR code.",
-            foreground="gray",
+            style="Muted.TLabel",
         )
         self.sub_placeholder.pack(anchor="w")
         self.sub_urls_box = tk.Text(
@@ -273,7 +289,7 @@ class App:
         self.qr_missing_label = ttk.Label(
             sub_content,
             text="Install qrcode[pil] to show QR",
-            foreground="gray",
+            style="Muted.TLabel",
         )
 
     def _build_proxies_tab(self, parent: ttk.Frame) -> None:
@@ -455,6 +471,7 @@ class App:
     # ------------------------------------------------------- context menus
 
     def _popup_menu(self, menu: tk.Menu, event: tk.Event) -> str:
+        style_menu(menu, self._theme_palette)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1117,8 +1134,45 @@ class App:
         self._loading_config = True
         try:
             self.settings.load_from_config(config)
+            theme = normalize_theme(getattr(config, "GUI_THEME", None) if config else None)
+            self.settings.var("gui", "theme").set(theme)
         finally:
             self._loading_config = False
+
+    def _watch_theme_var(self) -> None:
+        var = self.settings.var("gui", "theme")
+        self._watch_config_var(var)
+        var.trace_add("write", lambda *_args: self._on_theme_var_changed())
+
+    def _on_theme_var_changed(self) -> None:
+        if getattr(self, "_loading_config", False) or getattr(self, "_applying_theme", False):
+            return
+        if not hasattr(self, "root"):
+            return
+        try:
+            self.root.after_idle(self._apply_theme)
+        except tk.TclError:
+            pass
+
+    def _apply_theme(self) -> None:
+        if getattr(self, "_applying_theme", False):
+            return
+        self._applying_theme = True
+        try:
+            name = normalize_theme(self.settings.var("gui", "theme").get())
+            current = str(self.settings.var("gui", "theme").get()).strip().lower()
+            if current != name:
+                self.settings.var("gui", "theme").set(name)
+            self._theme_palette = apply_theme(self.root, name)
+            self.settings.apply_theme_surfaces(name)
+            if hasattr(self, "pool_tree"):
+                try:
+                    self.pool_tree.tag_configure("odd", background=self._theme_palette.tree_alt)
+                    self.pool_tree.tag_configure("even", background=self._theme_palette.input_bg)
+                except tk.TclError:
+                    pass
+        finally:
+            self._applying_theme = False
 
     def _watch_config_var(self, var: tk.Variable) -> None:
         var.trace_add("write", lambda *_args: self._schedule_save_ui_config())
@@ -1470,8 +1524,15 @@ class App:
                 if iid in existing:
                     if tuple(self.pool_tree.item(iid, "values")) != values:
                         self.pool_tree.item(iid, values=values)
+                    self.pool_tree.item(iid, tags=("odd" if index % 2 else "even",))
                 else:
-                    self.pool_tree.insert("", "end", iid=iid, values=values)
+                    self.pool_tree.insert(
+                        "",
+                        "end",
+                        iid=iid,
+                        values=values,
+                        tags=("odd" if index % 2 else "even",),
+                    )
             wanted_set = set(wanted)
             for iid in existing:
                 if iid not in wanted_set:

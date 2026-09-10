@@ -27,6 +27,7 @@ class ConfigField:
     maximum: int | float | None = None
     width: int = 36
     hint: str = ""
+    choices: tuple[str, ...] = ()
 
 
 CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
@@ -475,6 +476,15 @@ CONFIG_TABS: tuple[tuple[str, tuple[ConfigField, ...]], ...] = (
     (
         "GUI",
         (
+            ConfigField(
+                "gui",
+                "theme",
+                "Theme",
+                "str",
+                "dark",
+                choices=("dark", "light"),
+                hint="Applies to the whole control panel (tabs, tables, log, menus).",
+            ),
             ConfigField("gui", "auto_start_scraper", "Auto-start scraper", "bool", False),
             ConfigField(
                 "gui",

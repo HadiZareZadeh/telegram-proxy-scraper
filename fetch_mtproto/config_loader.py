@@ -62,6 +62,7 @@ _FIELD_MAP: tuple[tuple[str, str, str], ...] = (
     ("probe", "max_failed", "PROBE_MAX_FAILED"),
     ("probe", "failed_limit", "PROBE_FAILED_LIMIT"),
     ("probe", "prune_incompatible_v2ray", "PROBE_PRUNE_INCOMPATIBLE_V2RAY"),
+    ("gui", "theme", "GUI_THEME"),
     ("gui", "auto_start_scraper", "GUI_AUTO_START_SCRAPER"),
     ("gui", "auto_start_subscription_server", "GUI_AUTO_START_SUBSCRIPTION_SERVER"),
     ("gui", "auto_start_proxy_pool", "GUI_AUTO_START_PROXY_POOL"),

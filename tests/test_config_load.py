@@ -24,6 +24,10 @@ class ConfigLoadTests(unittest.TestCase):
         self.assertEqual(ns.PROXY_POOL_STANDBY_OUTBOUNDS, 300)
         self.assertEqual(ns.PROXY_POOL_RESERVE_OUTBOUNDS, 100)
 
+    def test_example_yaml_gui_theme(self) -> None:
+        ns = _parse_config(_EXAMPLE_PATH)
+        self.assertEqual(ns.GUI_THEME, "dark")
+
 
 if __name__ == "__main__":
     unittest.main()

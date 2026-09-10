@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from fetch_mtproto.config_loader import config_bool, config_float, config_int
 from fetch_mtproto.gui.config_fields import CONFIG_TABS, ConfigField
+from fetch_mtproto.gui.theme import palette_for
 
 if TYPE_CHECKING:
     from fetch_mtproto.gui.app import App
@@ -22,6 +23,8 @@ class ConfigSettingsPanel:
         self.vars: dict[tuple[str, str], tk.Variable] = {}
         self.list_widgets: dict[tuple[str, str], tk.Text] = {}
         self._pool_input_widgets: list[tk.Widget] = []
+        self._scroll_canvases: list[tk.Canvas] = []
+        self._muted_labels: list[ttk.Label] = []
         self._init_vars()
 
     def _key(self, field: ConfigField) -> tuple[str, str]:
@@ -62,6 +65,7 @@ class ConfigSettingsPanel:
 
     def _scrollable(self, parent: ttk.Frame) -> ttk.Frame:
         canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
+        self._scroll_canvases.append(canvas)
         scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas)
         inner.bind(
@@ -105,9 +109,14 @@ class ConfigSettingsPanel:
             widget.grid(row=display_row, column=1, sticky="ew", pady=(6, 2))
             display_row += 1
             if field.hint:
-                ttk.Label(parent, text=field.hint, foreground="gray", wraplength=520).grid(
-                    row=display_row, column=1, sticky="w", pady=(0, 6)
+                hint = ttk.Label(
+                    parent,
+                    text=field.hint,
+                    style="Muted.TLabel",
+                    wraplength=520,
                 )
+                hint.grid(row=display_row, column=1, sticky="w", pady=(0, 6))
+                self._muted_labels.append(hint)
                 display_row += 1
             if field.section == "proxy_pool" and field.kind != "bool":
                 self._pool_input_widgets.append(widget)
@@ -116,6 +125,17 @@ class ConfigSettingsPanel:
     def _build_field(self, parent: ttk.Frame, field: ConfigField) -> tk.Widget:
         key = self._key(field)
         variable = self.vars[key]
+
+        if field.choices:
+            widget = ttk.Combobox(
+                parent,
+                textvariable=variable,
+                values=list(field.choices),
+                state="readonly",
+                width=min(16, max(8, field.width // 3)),
+            )
+            self.app._watch_config_var(variable)
+            return widget
 
         if field.kind == "bool":
             widget = ttk.Checkbutton(parent, variable=variable)
@@ -239,5 +259,22 @@ class ConfigSettingsPanel:
         for widget in self._pool_input_widgets:
             try:
                 widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def apply_theme_surfaces(self, theme_name: object) -> None:
+        palette = palette_for(theme_name)
+        for canvas in self._scroll_canvases:
+            try:
+                canvas.configure(
+                    background=palette.bg,
+                    highlightbackground=palette.bg,
+                    highlightcolor=palette.accent,
+                )
+            except tk.TclError:
+                pass
+        for label in self._muted_labels:
+            try:
+                label.configure(style="Muted.TLabel")
             except tk.TclError:
                 pass
