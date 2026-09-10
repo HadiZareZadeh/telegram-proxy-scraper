@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 
@@ -49,9 +50,12 @@ def _print_run_summary(stats, summary) -> None:
     _print_fastest(stats.fastest)
 
 
-async def run(config, best: list) -> None:
+async def run(config, best: list, *, force_all: bool = False) -> None:
     db, _mt, catalog = open_catalogs(config)
     try:
+        if force_all:
+            marked = db.v2ray_mark_all_due()
+            print(f"Forced full-catalog probe: marked {marked} server(s) due.")
         due = catalog.due_servers()
         working, failed = catalog.counts()
         if not due and not catalog.all_unique():
@@ -141,6 +145,12 @@ async def run(config, best: list) -> None:
                 )
                 if stats.checked == 0:
                     break
+                # Give Windows time to release SOCKS/API listeners before the next wave.
+                cleanup_ping_xray(
+                    base_port=kwargs["base_port"],
+                    concurrency=kwargs["concurrency"],
+                )
+                await asyncio.sleep(0.5)
         last_stats = V2RayReorganizeStats(
             combined_ok,
             combined_fail,
@@ -158,11 +168,20 @@ async def run(config, best: list) -> None:
 def main() -> None:
     from fetch_mtproto.logging_setup import setup_logging
 
+    parser = argparse.ArgumentParser(
+        description="Test due V2Ray servers in the SQLite catalog."
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="ignore probe scheduling and retest every Xray-compatible catalog server",
+    )
+    args = parser.parse_args()
     setup_logging()
     config = load_config()
     best: list = [None]
     try:
-        asyncio.run(run(config, best))
+        asyncio.run(run(config, best, force_all=args.all))
     except KeyboardInterrupt:
         print("\nInterrupted.")
         print()

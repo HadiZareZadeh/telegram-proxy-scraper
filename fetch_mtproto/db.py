@@ -1270,6 +1270,12 @@ class CatalogDB:
             query += f" LIMIT {int(limit)}"
         return list(self.conn.execute(query, (due,)))
 
+    def v2ray_mark_all_due(self) -> int:
+        """Make every catalog row eligible for the next V2Ray probe run."""
+        cur = self.conn.execute("UPDATE v2ray SET probe_due_at = NULL")
+        self.conn.commit()
+        return cur.rowcount
+
     def v2ray_hot_candidates(
         self,
         *,

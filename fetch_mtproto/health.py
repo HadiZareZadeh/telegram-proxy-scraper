@@ -305,9 +305,10 @@ def next_probe_due_iso(
         else:
             delay = 10 * 60
     elif state == "dead":
-        # 10m, 30m, 1h, 3h …
+        # Retest chronic failures more often so large catalogs keep circulating.
+        # 5m, 10m, 20m, 40m … capped at 45m (was up to 3h).
         steps = max(0, consecutive_failures - 3)
-        minutes = min(180, 10 * (3 ** min(steps, 4)))
+        minutes = min(45, 5 * (2 ** min(steps, 4)))
         delay = int(minutes * 60)
     else:
         delay = 30 * 60

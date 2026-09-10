@@ -83,7 +83,13 @@ class StateTests(unittest.TestCase):
                 "dead", consecutive_failures=3, check_count=5, now=now
             )
         )
-        self.assertEqual(dead, now + timedelta(minutes=10))
+        self.assertEqual(dead, now + timedelta(minutes=5))
+        dead_later = parse_iso(
+            next_probe_due_iso(
+                "dead", consecutive_failures=7, check_count=10, now=now
+            )
+        )
+        self.assertEqual(dead_later, now + timedelta(minutes=45))
 
 
 if __name__ == "__main__":

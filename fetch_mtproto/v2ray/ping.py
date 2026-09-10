@@ -375,7 +375,7 @@ async def ping_v2ray_servers(
     await loop.run_in_executor(
         None,
         lambda: wait_ping_ports_free(
-            base_port=base_port, concurrency=batch_size, timeout=5.0
+            base_port=base_port, concurrency=batch_size, timeout=20.0
         ),
     )
 
@@ -402,6 +402,65 @@ async def ping_v2ray_servers(
         return server
 
     session: XrayLiveSession | None = None
+
+    async def _stop_session() -> None:
+        nonlocal session
+        current = session
+        session = None
+        if current is None:
+            return
+        try:
+            await current.close_control()
+        except Exception:
+            pass
+        await loop.run_in_executor(None, current.stop)
+
+    async def _start_session() -> bool:
+        nonlocal session
+        session = XrayLiveSession(
+            bin_path=bin_path,
+            slots=ping_live_slots(base_port, batch_size),
+            api_port=ping_api_port(base_port, batch_size),
+            prefix="xray-ping",
+        )
+        try:
+            await loop.run_in_executor(None, session.start)
+            return True
+        except Exception:
+            session = None
+            return False
+
+    async def _retry_crashed_batch(
+        batch: list[V2RayServer],
+    ) -> list[V2RayPingResult]:
+        """Isolate a config that killed Xray so neighbors are still tested."""
+        isolated: list[V2RayPingResult] = []
+        for server in batch:
+            if cancel_event and cancel_event.is_set():
+                break
+            if session is None or not session.running:
+                await _stop_session()
+                if not await _start_session():
+                    isolated.append(
+                        V2RayPingResult(
+                            server=server,
+                            latency=None,
+                            error="outbound swap failed: probe xray did not restart",
+                        )
+                    )
+                    continue
+            one = await _probe_batch_on_session(
+                session,
+                [server],
+                timeout=timeout,
+                test_url=test_url,
+                test_bytes=test_bytes,
+            )
+            isolated.extend(one)
+            if not session.running:
+                await _stop_session()
+        return isolated
+
     try:
         for offset in range(0, len(servers), tcp_chunk):
             if cancel_event and cancel_event.is_set():
@@ -420,23 +479,10 @@ async def ping_v2ray_servers(
             if not survivors:
                 continue
             if session is not None and not session.running:
-                try:
-                    await session.close_control()
-                except Exception:
-                    pass
-                await loop.run_in_executor(None, session.stop)
-                session = None
+                await _stop_session()
             if session is None:
-                session = XrayLiveSession(
-                    bin_path=bin_path,
-                    slots=ping_live_slots(base_port, batch_size),
-                    api_port=ping_api_port(base_port, batch_size),
-                    prefix="xray-ping",
-                )
-                try:
-                    await loop.run_in_executor(None, session.start)
-                except Exception:
-                    session = None
+                started = await _start_session()
+                if not started:
                     for server in survivors:
                         done += 1
                         fail = V2RayPingResult(
@@ -454,6 +500,23 @@ async def ping_v2ray_servers(
                     break
                 batch = survivors[next_index : next_index + batch_size]
                 next_index += len(batch)
+                if session is None or not session.running:
+                    await _stop_session()
+                    if not await _start_session():
+                        batch_results = [
+                            V2RayPingResult(
+                                server=server,
+                                latency=None,
+                                error="outbound swap failed: probe xray did not restart",
+                            )
+                            for server in batch
+                        ]
+                        for result in batch_results:
+                            done += 1
+                            results.append(result)
+                            if on_result:
+                                on_result(done, total, result)
+                        continue
                 batch_results = await _probe_batch_on_session(
                     session,
                     batch,
@@ -461,18 +524,18 @@ async def ping_v2ray_servers(
                     test_url=test_url,
                     test_bytes=test_bytes,
                 )
+                if not session.running and len(batch) > 1:
+                    # A malformed outbound can terminate Xray. Retry this batch one
+                    # at a time so only the offending server receives that failure.
+                    await _stop_session()
+                    batch_results = await _retry_crashed_batch(batch)
                 for result in batch_results:
                     done += 1
                     results.append(result)
                     if on_result:
                         on_result(done, total, result)
     finally:
-        if session is not None:
-            try:
-                await session.close_control()
-            except Exception:
-                pass
-            await loop.run_in_executor(None, session.stop)
+        await _stop_session()
 
     return results
 

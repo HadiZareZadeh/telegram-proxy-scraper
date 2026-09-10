@@ -13,7 +13,6 @@ telegram:
     - "@meliproxyy"
     - "@Filtereshekan"
     - "@bored_vpn"
-    - "@abc_configs"
     - "@V2RayRootFree"
     - "@v2ray_free_conf"
     - "@daily_configs"
@@ -24,8 +23,35 @@ telegram:
     - "@ProxyMTProto_tel"
     - "@Cheetah_MTP"
     - "@NPROXY"
-  # How many recent messages to scan per source (null = all history; can be slow)
-  messages_per_source: 500
+    - "@OnlineVpnConfigs"
+    - "@VIProxys"
+    - "@v2cnf"
+    - "@DailyV2RY"
+    - "@xrayfree"
+    - "@V2ray_Click"
+    - "@V2rayuir"
+    - "@v2proxys"
+    - "@v2raynetirana"
+    - "@ConfigsV2ray"
+    - "@FreeV2rays"
+    - "@v2ray_configs_pool"
+    - "@Hope_Net"
+    - "@FreakConfig"
+    - "@ConfigV2rayNG"
+    - "@ARv2ray"
+    - "@LRNoc"
+    - "@vlessconfig"
+    - "@vmessprotocol"
+    - "@v2rayngvpn"
+    - "@OutlineVpnFree"
+    - "@PrivateVPNs"
+    - "@vpnfail_vless"
+    - "@v2raycollector"
+    - "@freev2raysn"
+    - "@VlessConfigFree"
+    - "@v2box_free"
+    - "@proxy_mtproto_ir"
+  messages_per_source: 300
 
 storage:
   database_file: data/catalog.db
@@ -36,6 +62,7 @@ subscription_server:
   host: 0.0.0.0
   port: 8765
   # lan_ip: 192.168.1.105  # optional: force LAN URL/QR when VPN/TUN is active
+  lan_ip: null
 
 xray:
   # null = auto-detect PATH, then xray/xray.exe or xray/xray
@@ -44,47 +71,35 @@ xray:
 v2ray:
   # HTTP URL fetched through each V2Ray proxy (latency = TTFB). Default is an empty 204.
   # Set test_bytes > 0 only if you want to also read that many body bytes.
-  test_url: http://www.gstatic.com/generate_204
+  test_url: "http://www.gstatic.com/generate_204"
   test_bytes: 0
   test_timeout: 2.5
   # Parallel Xray probe slots (gRPC outbound swap on one probe process)
-  ping_concurrency: 256
-  tcp_concurrency: 500
+  ping_concurrency: 64
+  tcp_concurrency: 250
   tcp_timeout: 1.25
   # Local SOCKS ports for Ping V2Ray: 45001 .. 45001+concurrency-1 (API at 45520)
   ping_base_port: 45001
-  # Inventory cap: prune only chronic dead when over this (0 = unlimited)
   catalog_max: 50000
   # Unused for V2Ray (healthy rows are never demoted just for ranking)
   max_working: 0
   # Fastest, most recently checked working servers exported to subscription.txt (0 = unlimited)
-  # This is a query/export limit, not a catalog cap.
-  subscription_limit: 100
+  subscription_limit: 300
   # Expand HTTP subscription URLs and inline Base64 blobs into individual share links
   expand_subscriptions: true
   subscription_fetch_timeout: 15.0
   # Max HTTP sub URLs fetched per Telegram message (inline Base64 is always scanned)
-  subscription_max_urls_per_message: 5
+  subscription_max_urls_per_message: 10
   # Download .npv4 / .npv / .npvt attachments and extract embedded V2Ray servers
   parse_napsternet_attachments: true
   # Decrypt NPVT1 / NPVTSUB1 encrypted Napsternet attachments before extraction
   decrypt_npvt_attachments: true
 
 scraper:
-  # Pause between re-ping runs (seconds; V2Ray only probes rows whose probe_due_at is due)
-  proxy_check_interval: 300
+  # How often the scraper re-pings MTProto + due V2Ray rows (seconds; 0 = disabled)
+  proxy_check_interval: 1200
   # Pause before reconnecting after a dropped Telegram connection (seconds)
   reconnect_delay: 5
-
-url_sources:
-  # Periodically fetch V2Ray share links from HTTP(S) lists (e.g. GitHub raw files)
-  enabled: true
-  urls_file: urls.txt
-  # Seconds between fetches while scraper / URL-sources job is running (0 = once only)
-  fetch_interval: 3600
-  fetch_timeout: 30.0
-  # Parallel HTTP downloads
-  concurrency: 5
 
 mtproto:
   ping_concurrency: 100
@@ -93,40 +108,36 @@ mtproto:
   max_working: 1000
 
 probe:
-  # Adaptive probe scheduler for MTProto (explore / exploit / recover)
-  # V2Ray Ping uses probe_due_at (unknown now, healthy 5–15m, degraded 2m, dead backoff).
-  # Skip chronic MTProto failures until their backoff window expires.
+  # Adaptive probe scheduler (explore / exploit / recover)
+  # Skip chronic failures until their backoff window expires.
   respect_backoff: true
-  # Drop dead servers so ping runs stay fast (applied after each check + at startup)
-  prune_after_failures: 8      # consecutive failures with zero lifetime successes
-  prune_min_checks: 5          # minimum probes before a server can be pruned
-  prune_stale_days: 14         # remove failed servers not checked in this many days
-  max_failed: 2000             # cap failed rows kept in DB (0 = unlimited)
-  failed_limit: 500            # max failed MTProto servers to re-probe per run (0 = unlimited; working always probed)
-  prune_incompatible_v2ray: true  # delete xhttp / splithttp / raw (Nekoray-incompatible)
+  # Preserve known failures so periodic URL imports do not re-add them as unknown.
+  prune_after_failures: 0
+  prune_min_checks: 5
+  prune_stale_days: 0
+  max_failed: 20000
+  failed_limit: 0
+  prune_incompatible_v2ray: true
 
 proxy_pool:
-  # Local SOCKS5 + HTTP slots (one never-restarted Xray). Slot 0 SOCKS stays 10801.
-  # HTTP is a separate range. Rotation is OverrideBalancerTarget (existing TCP sessions stay).
-  start_port: 10801
-  socks_start_port: 10801
-  http_start_port: 11201
+  # Local SOCKS5+HTTP slots. One Xray process; rotate does not restart it.
+  start_port: 16001
+  socks_start_port: 16001
+  http_start_port: 16401
   xray_api_port: 20802
   stats_port: 20802
   count: 300
-  standby_outbounds: 300
-  reserve_outbounds: 100
-  # Optional timed shuffle of healthy slots (0 = off; failed slots are replaced automatically)
-  diversity_rotate_sec: 0
-  switch_interval_sec: 0
-  reuse_after_rotations: 1
-  reuse_after_sec: 600
-  min_reuse_sec: 600
+  standby_outbounds: 600
+  reserve_outbounds: 200
+  diversity_rotate_sec: 30
+  switch_interval_sec: 30
+  reuse_after_rotations: 5
+  # Keep short while unique healthy inventory is << slot count (else rotation reuses the same ~100 nodes).
+  reuse_after_sec: 60
+  min_reuse_sec: 30
   rotate_mode: assignment
   rotate_existing_connections: false
-  # Working servers at or below this latency (ms) are eligible for the hot ring
   max_latency_ms: 3000
-  # true = shuffle eligible servers each assignment; false = fastest-first
   random: true
 
 hot_set:
@@ -137,15 +148,20 @@ hot_set:
 
 gui:
   # When using app.pyw, start these jobs automatically after the control panel opens
-  auto_start_scraper: false
-  auto_start_subscription_server: false
-  auto_start_proxy_pool: false
+  auto_start_scraper: true
+  auto_start_subscription_server: true
+  auto_start_proxy_pool: true
+  auto_start_ping_v2ray: true
   # Proxies tab: how many MTProto links to open/copy by default
   proxy_open_top: 10
   # Vertical split: fraction of window for tabs (rest is log + input)
-  main_pane_ratio: 0.65
-  # Long-running jobs (scraper, subscription server, proxy pool) restart on
-  # unexpected exit forever: delay = min(max, base * 2^attempt), then cleanup + re-run.
-  restart_backoff_sec: 2
-  restart_backoff_max_sec: 30
+  main_pane_ratio: 0.73
+  restart_backoff_sec: 2.0
+  restart_backoff_max_sec: 30.0
 
+url_sources:
+  enabled: true
+  urls_file: urls.txt
+  fetch_interval: 900
+  fetch_timeout: 30.0
+  concurrency: 8

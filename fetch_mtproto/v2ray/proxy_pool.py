@@ -345,22 +345,30 @@ class ProxyPoolRunner:
         last_hot = 0.0
         last_diversity = time.monotonic()
         while not self._stop_event.is_set():
-            now = time.monotonic()
-            if now - last_hot >= self.hot_refresh_sec or last_hot == 0.0:
-                await self._refresh_hot_and_assign(initial=last_hot == 0.0)
-                last_hot = now
-            if self._rotate_all_event.is_set():
-                self._rotate_all_event.clear()
-                await self._rotate_all()
-                last_diversity = time.monotonic()
-            if (
-                self.diversity_rotate_sec > 0
-                and now - last_diversity >= self.diversity_rotate_sec
-            ):
-                await self._rotate_all()
-                last_diversity = time.monotonic()
-            await self._refresh_traffic()
-            self._emit_status()
+            try:
+                now = time.monotonic()
+                if now - last_hot >= self.hot_refresh_sec or last_hot == 0.0:
+                    await self._refresh_hot_and_assign(initial=last_hot == 0.0)
+                    last_hot = now
+                if self._rotate_all_event.is_set():
+                    self._rotate_all_event.clear()
+                    await self._rotate_all()
+                    last_diversity = time.monotonic()
+                if (
+                    self.diversity_rotate_sec > 0
+                    and now - last_diversity >= self.diversity_rotate_sec
+                ):
+                    await self._rotate_all()
+                    last_diversity = time.monotonic()
+                await self._refresh_traffic()
+                self._emit_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Keep listeners up; a single gRPC/catalog failure must not kill the pool.
+                self._log(f"[proxy pool] loop error (continuing): {exc}")
+                await asyncio.sleep(2.0)
+                continue
             await asyncio.sleep(TRAFFIC_POLL_SEC)
 
     def _catalog_rows(self):
@@ -370,6 +378,15 @@ class ProxyPoolRunner:
             max_latency_ms=self.max_latency_ms,
             freshness_sec=self.freshness_sec,
         )
+        # If the fresh hot set is thinner than the slot count, widen freshness so
+        # recently-known working nodes can still fill the ring.
+        if len(rows) < self.count:
+            wider = db.v2ray_hot_candidates(
+                max_latency_ms=self.max_latency_ms,
+                freshness_sec=max(self.freshness_sec, 3600.0),
+            )
+            if len(wider) > len(rows):
+                rows = wider
         # Freshly probed-but-not-yet-verified healthy rows: allow catalog latency.
         if not rows:
             rows = db.conn.execute(

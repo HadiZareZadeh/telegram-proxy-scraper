@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
@@ -15,6 +16,25 @@ from fetch_mtproto.v2ray.store import (
     normalize_stream_security,
     vmess_stream_security,
 )
+
+_XRAY_CLIENT_NETWORKS = frozenset({"tcp", "ws", "grpc", "httpupgrade"})
+_XRAY_SS_METHODS = frozenset(
+    {
+        "aes-128-gcm",
+        "aes-256-gcm",
+        "chacha20-poly1305",
+        "chacha20-ietf-poly1305",
+        "xchacha20-poly1305",
+    }
+)
+
+
+def _valid_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
 
 
 def _q(qs: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -44,6 +64,8 @@ def _stream_settings_from_query(
     qs: dict[str, list[str]], *, default_security: str = ""
 ) -> dict[str, Any] | None:
     network = (_q(qs, "type") or _q(qs, "network") or "tcp").lower()
+    if network not in _XRAY_CLIENT_NETWORKS:
+        return None
     security = normalize_stream_security(_q(qs, "security") or default_security or "none")
     if security is None:
         return None
@@ -132,7 +154,7 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     uuid = str(obj.get("id") or "").strip()
-    if not host or not uuid:
+    if not host or not _valid_uuid(uuid):
         return None
 
     try:
@@ -141,6 +163,8 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
         alter_id = 0
 
     network = str(obj.get("net") or "tcp").lower()
+    if network not in _XRAY_CLIENT_NETWORKS:
+        return None
     security = vmess_stream_security(obj)
     if security is None:
         return None
@@ -175,12 +199,6 @@ def _outbound_vmess(server: V2RayServer) -> dict[str, Any] | None:
         }
     elif network == "grpc":
         stream["grpcSettings"] = {"serviceName": str(obj.get("path") or "")}
-    elif network in {"h2", "http"}:
-        stream["network"] = "http"
-        stream["httpSettings"] = {
-            "path": str(obj.get("path") or "/"),
-            "host": [str(obj.get("host") or sni or host)],
-        }
     elif network == "tcp":
         header_type = str(obj.get("type") or "none")
         if header_type and header_type != "none":
@@ -212,12 +230,19 @@ def _outbound_vless(server: V2RayServer) -> dict[str, Any] | None:
     host, port = _safe_parsed_host_port(parsed)
     if host is None or port is None:
         host, port = server.host, server.port
-    if not host or not (1 <= int(port) <= 65535) or not parsed.username:
+    identity = unquote(parsed.username or "")
+    if (
+        not host
+        or not (1 <= int(port) <= 65535)
+        or not _valid_uuid(identity)
+    ):
         return None
     qs = parse_qs(parsed.query)
+    if (_q(qs, "encryption") or "none").lower() != "none":
+        return None
     user: dict[str, Any] = {
-        "id": unquote(parsed.username),
-        "encryption": _q(qs, "encryption") or "none",
+        "id": identity,
+        "encryption": "none",
     }
     flow = _q(qs, "flow")
     if flow:
@@ -334,7 +359,13 @@ def _outbound_ss(server: V2RayServer) -> dict[str, Any] | None:
             except ValueError:
                 return None
 
-    if not host or not method or not password or not (1 <= port <= 65535):
+    method = method.strip().lower()
+    if (
+        not host
+        or method not in _XRAY_SS_METHODS
+        or not password
+        or not (1 <= port <= 65535)
+    ):
         return None
 
     return {

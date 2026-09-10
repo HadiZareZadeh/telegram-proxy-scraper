@@ -516,16 +516,17 @@ class V2RayCatalog:
                 failed_limit=failed_limit,
             )
             if (server := _server_from_row(row)).scheme in XRAY_SCHEMES
-            and is_nekoray_compatible(server)
+            and is_importable_v2ray(server)
         ]
 
     def due_servers(self, *, limit: int | None = None) -> list[V2RayServer]:
-        return [
+        servers = [
             server
-            for row in self.db.v2ray_due_probe_rows(limit=limit)
+            for row in self.db.v2ray_due_probe_rows()
             if (server := _server_from_row(row)).scheme in XRAY_SCHEMES
-            and is_nekoray_compatible(server)
+            and is_importable_v2ray(server)
         ]
+        return servers[:limit] if limit is not None and limit > 0 else servers
 
     def prune_stale(self) -> dict[str, int]:
         if self.prune_settings is None or not self.prune_settings.enabled:
