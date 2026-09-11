@@ -63,6 +63,35 @@ FinishedFn = Callable[[], None]
 TRAFFIC_POLL_SEC = 2.0
 EMPTY_CATALOG_WAIT_SEC = 30.0
 TRUST_FRESHNESS_SEC = 900.0
+XRAY_RESTART_BACKOFF_SEC = 2.0
+XRAY_RESTART_BACKOFF_MAX_SEC = 30.0
+XRAY_STABLE_UPTIME_SEC = 60.0
+
+
+def xray_restart_delay(attempt: int, *, base: float = XRAY_RESTART_BACKOFF_SEC, max_sec: float = XRAY_RESTART_BACKOFF_MAX_SEC) -> float:
+    """Exponential backoff between in-process Xray respawns."""
+    return min(float(max_sec), float(base) * (2 ** max(0, int(attempt))))
+
+
+def _looks_like_control_error(exc: BaseException) -> bool:
+    name = type(exc).__name__.lower()
+    if "rpc" in name:
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    text = str(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "unavailable",
+            "goaway",
+            "not connected",
+            "socket closed",
+            "statuscode",
+            "grpc",
+            "control channel",
+        )
+    )
 
 
 @dataclass(slots=True)
@@ -118,7 +147,7 @@ class _Lease:
 
 
 class ProxyPoolRunner:
-    """One never-restarted pool Xray; rotate by OverrideBalancerTarget only."""
+    """One pool Xray; rotate by OverrideBalancerTarget; respawn Xray if it dies."""
 
     def __init__(
         self,
@@ -177,12 +206,18 @@ class ProxyPoolRunner:
         self._bin_path: str | None = None
         self._pool_process: subprocess.Popen | None = None
         self._pool_cfg_path: Path | None = None
+        self._pool_err_path: Path | None = None
+        self._pool_err_file: object | None = None
+        self._xray_started_at: float | None = None
         self._control: XrayControlChannel | None = None
         self._handler: HandlerClient | None = None
         self._routing: RoutingClient | None = None
         self._stats: StatsClient | None = None
         self._latency_by_key: dict[str, float] = {}
         self._rotate_all_event = threading.Event()
+        self._xray_restart_attempt = 0
+        self._control_fail_streak = 0
+        self._last_xray_stderr = ""
 
     @property
     def running(self) -> bool:
@@ -257,25 +292,102 @@ class ProxyPoolRunner:
         if warning:
             self._log(f"[proxy pool] {warning}")
 
-        killed = cleanup_pool_xray(
-            start_port=self.start_port,
-            count=self.count,
-            http_start=self.http_start_port,
-            api_port=self.api_port,
-        )
-        if killed:
-            self._log(
-                f"[proxy pool] cleared {len(killed)} leftover xray process(es) "
-                f"on SOCKS {self.start_port}+ / HTTP {self.http_start_port}+"
-            )
-
-        ports = []
         with self._slots_lock:
             self._slots = []
             for index in range(self.count):
                 socks, http = slot_ports(self.start_port, self.http_start_port, index)
-                ports.extend((socks, http))
                 self._slots.append(_ProxySlot(socks_port=socks, http_port=http))
+
+        if not self._preflight_ports():
+            return
+
+        if not await self._launch_xray(reason="start"):
+            return
+
+        rotate_sec = self.diversity_rotate_sec
+        rotate_note = (
+            f", diversity rotate every {rotate_sec:.0f}s"
+            if rotate_sec > 0
+            else ", diversity rotate off"
+        )
+        self._log(
+            f"[proxy pool] xray ready: {self.count} SOCKS "
+            f"{self.start_port}–{self.start_port + self.count - 1}, "
+            f"HTTP {self.http_start_port}–{self.http_start_port + self.count - 1}, "
+            f"api {self.api_port} (respawn on crash, no restart on rotate{rotate_note})"
+        )
+
+        last_hot = 0.0
+        last_diversity = time.monotonic()
+        self._xray_restart_attempt = 0
+        self._control_fail_streak = 0
+        while not self._stop_event.is_set():
+            try:
+                if self._xray_needs_restart():
+                    if not await self._recover_xray():
+                        return
+                    last_hot = time.monotonic()
+                    last_diversity = last_hot
+                    self._control_fail_streak = 0
+                    continue
+                now = time.monotonic()
+                if (
+                    self._xray_started_at is not None
+                    and (now - self._xray_started_at) >= XRAY_STABLE_UPTIME_SEC
+                ):
+                    self._xray_restart_attempt = 0
+                if now - last_hot >= self.hot_refresh_sec or last_hot == 0.0:
+                    await self._refresh_hot_and_assign(initial=last_hot == 0.0)
+                    last_hot = now
+                if self._rotate_all_event.is_set():
+                    self._rotate_all_event.clear()
+                    await self._rotate_all()
+                    last_diversity = time.monotonic()
+                if (
+                    self.diversity_rotate_sec > 0
+                    and now - last_diversity >= self.diversity_rotate_sec
+                ):
+                    await self._rotate_all()
+                    last_diversity = time.monotonic()
+                if not await self._refresh_traffic():
+                    if self._pool_process_alive() and not await self._reconnect_control():
+                        self._control_fail_streak += 1
+                    else:
+                        self._control_fail_streak = 0
+                    if self._control_fail_streak >= 3:
+                        self._log(
+                            "[proxy pool] control channel dead — restarting xray"
+                        )
+                        self._kill_process()
+                        self._control_fail_streak = 0
+                        continue
+                else:
+                    self._control_fail_streak = 0
+                self._emit_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Keep listeners up; a single gRPC/catalog failure must not kill the pool.
+                self._log(f"[proxy pool] loop error (continuing): {exc}")
+                if not self._pool_process_alive():
+                    await asyncio.sleep(0.5)
+                    continue
+                if _looks_like_control_error(exc):
+                    await self._reconnect_control()
+                await asyncio.sleep(2.0)
+                continue
+            await asyncio.sleep(TRAFFIC_POLL_SEC)
+
+    def _xray_needs_restart(self) -> bool:
+        if self._stop_event.is_set():
+            return False
+        return not self._pool_process_alive()
+
+    def _preflight_ports(self) -> bool:
+        ports = []
+        with self._slots_lock:
+            for slot in self._slots:
+                ports.extend((slot.socks_port, slot.http_port))
         ports.append(self.api_port)
         dynamic = query_dynamic_tcp_ports()
         excluded = query_excluded_tcp_ranges()
@@ -290,7 +402,7 @@ class ProxyPoolRunner:
             self._log(
                 "[proxy pool] refusing to bind — change SOCKS/HTTP/API ports in Settings"
             )
-            return
+            return False
         blocked = unbindable_localhost_ports(ports)
         if blocked:
             sample = ", ".join(str(p) for p in blocked[:8])
@@ -298,10 +410,56 @@ class ProxyPoolRunner:
             self._log(
                 f"[proxy pool] cannot bind {len(blocked)} port(s) on 127.0.0.1 "
                 f"({sample}{extra}) — pick SOCKS/HTTP ranges outside the "
-                f"Windows dynamic TCP pool"
+                "Windows dynamic TCP pool"
             )
-            return
+            return False
+        return True
 
+    async def _recover_xray(self) -> bool:
+        if self._stop_event.is_set():
+            return False
+        code = None
+        if self._pool_process is not None:
+            code = self._pool_process.poll()
+        tail = self._xray_error_tail() or self._last_xray_stderr
+        detail = f"code {code}" if code is not None else "process gone"
+        self._log(f"[proxy pool] xray died ({detail}) — will re-run")
+        if tail:
+            self._log(f"[proxy pool] xray stderr: {tail}")
+        if (
+            self._xray_started_at is not None
+            and (time.monotonic() - self._xray_started_at) >= XRAY_STABLE_UPTIME_SEC
+        ):
+            self._xray_restart_attempt = 0
+        delay = xray_restart_delay(self._xray_restart_attempt)
+        self._xray_restart_attempt += 1
+        self._log(
+            f"[proxy pool] restarting xray in {delay:.0f}s "
+            f"(attempt {self._xray_restart_attempt}, backoff)…"
+        )
+        await asyncio.sleep(delay)
+        if self._stop_event.is_set():
+            return False
+        if not await self._launch_xray(reason="respawn"):
+            self._log("[proxy pool] xray re-run failed — retrying")
+            return True
+        await self._refresh_hot_and_assign(initial=True)
+        self._log("[proxy pool] xray re-run complete; slots reassigned")
+        return True
+
+    async def _launch_xray(self, *, reason: str) -> bool:
+        await self._teardown_xray()
+        killed = cleanup_pool_xray(
+            start_port=self.start_port,
+            count=self.count,
+            http_start=self.http_start_port,
+            api_port=self.api_port,
+        )
+        if killed:
+            self._log(
+                f"[proxy pool] cleared {len(killed)} leftover xray process(es) "
+                f"on SOCKS {self.start_port}+ / HTTP {self.http_start_port}+"
+            )
         config = build_xray_slot_balancer_config(
             slot_count=self.count,
             socks_start=self.start_port,
@@ -313,63 +471,85 @@ class ProxyPoolRunner:
         try:
             self._pool_process, self._pool_cfg_path = self._start_xray(config)
         except OSError as exc:
-            self._log(f"[proxy pool] xray start failed: {exc}")
-            return
+            self._log(f"[proxy pool] xray {reason} failed: {exc}")
+            return False
 
         if not await self._wait_port("127.0.0.1", self.api_port, timeout=15.0):
             self._log("[proxy pool] API port did not open")
-            return
+            self._kill_process()
+            return False
         for slot in self._slots:
             if self._stop_event.is_set():
-                return
+                self._kill_process()
+                return False
             await self._wait_port("127.0.0.1", slot.socks_port, timeout=8.0)
 
-        self._control = XrayControlChannel(port=self.api_port)
-        await self._control.connect()
-        self._handler = HandlerClient(self._control)
-        self._routing = RoutingClient(self._control)
-        self._stats = StatsClient(self._control)
-        rotate_sec = self.diversity_rotate_sec
-        rotate_note = (
-            f", diversity rotate every {rotate_sec:.0f}s"
-            if rotate_sec > 0
-            else ", diversity rotate off"
-        )
-        self._log(
-            f"[proxy pool] xray ready: {self.count} SOCKS "
-            f"{self.start_port}–{self.start_port + self.count - 1}, "
-            f"HTTP {self.http_start_port}–{self.http_start_port + self.count - 1}, "
-            f"api {self.api_port} (no restart on rotate{rotate_note})"
-        )
+        if not await self._connect_control():
+            self._kill_process()
+            return False
+        self._xray_started_at = time.monotonic()
+        return True
 
-        last_hot = 0.0
-        last_diversity = time.monotonic()
-        while not self._stop_event.is_set():
+    async def _connect_control(self) -> bool:
+        await self._close_control()
+        try:
+            self._control = XrayControlChannel(port=self.api_port)
+            await self._control.connect()
+            self._handler = HandlerClient(self._control)
+            self._routing = RoutingClient(self._control)
+            self._stats = StatsClient(self._control)
+            return True
+        except Exception as exc:
+            self._log(f"[proxy pool] control connect failed: {exc}")
+            await self._close_control()
+            return False
+
+    async def _reconnect_control(self) -> bool:
+        if self._stop_event.is_set() or not self._pool_process_alive():
+            return False
+        self._log("[proxy pool] reconnecting xray control channel")
+        ok = await self._connect_control()
+        if ok:
+            self._log("[proxy pool] control channel reconnected")
+        return ok
+
+    async def _close_control(self) -> None:
+        control = self._control
+        self._control = None
+        self._handler = None
+        self._routing = None
+        self._stats = None
+        if control is None:
+            return
+        try:
+            await asyncio.wait_for(control.close(), timeout=1.5)
+        except Exception:
+            pass
+
+    async def _teardown_xray(self) -> None:
+        await self._close_control()
+        self._loaded_tags.clear()
+        self._kill_process()
+
+    def _xray_error_tail(self, limit: int = 1500) -> str:
+        err_file = self._pool_err_file
+        if err_file is not None:
             try:
-                now = time.monotonic()
-                if now - last_hot >= self.hot_refresh_sec or last_hot == 0.0:
-                    await self._refresh_hot_and_assign(initial=last_hot == 0.0)
-                    last_hot = now
-                if self._rotate_all_event.is_set():
-                    self._rotate_all_event.clear()
-                    await self._rotate_all()
-                    last_diversity = time.monotonic()
-                if (
-                    self.diversity_rotate_sec > 0
-                    and now - last_diversity >= self.diversity_rotate_sec
-                ):
-                    await self._rotate_all()
-                    last_diversity = time.monotonic()
-                await self._refresh_traffic()
-                self._emit_status()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # Keep listeners up; a single gRPC/catalog failure must not kill the pool.
-                self._log(f"[proxy pool] loop error (continuing): {exc}")
-                await asyncio.sleep(2.0)
-                continue
-            await asyncio.sleep(TRAFFIC_POLL_SEC)
+                err_file.flush()
+            except Exception:
+                pass
+        path = self._pool_err_path
+        if path is None or not path.is_file():
+            return ""
+        try:
+            data = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+        if not data:
+            return ""
+        if len(data) > limit:
+            data = data[-limit:]
+        return " ".join(data.split())
 
     def _catalog_rows(self):
         config = load_config(required=False)
@@ -616,13 +796,13 @@ class ProxyPoolRunner:
         await self._assign_keys(hot.all_keys, servers, replace_all=True)
         self._log(f"[proxy pool] rotate-all generation {self._generation}")
 
-    async def _refresh_traffic(self) -> None:
+    async def _refresh_traffic(self) -> bool:
         if self._stats is None or not self._pool_process_alive():
-            return
+            return False
         try:
             traffic = await self._stats.outbound_traffic()
         except Exception:
-            return
+            return False
         with self._slots_lock:
             slots = list(self._slots)
         for slot in slots:
@@ -632,6 +812,7 @@ class ProxyPoolRunner:
             up, down = traffic.get(tag, (0, 0))
             slot.upload_bytes = slot.base_upload + up
             slot.download_bytes = slot.base_download + down
+        return True
 
     def _start_xray(self, config: dict, *, prefix: str = "fetch-mtproto-pool"):
         if not self._bin_path:
@@ -640,24 +821,63 @@ class ProxyPoolRunner:
             f"{prefix}-{int(time.time() * 1000)}.json"
         )
         cfg_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-        proc = subprocess.Popen(
-            [self._bin_path, "run", "-c", str(cfg_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **hide_console_kwargs(),
-        )
+        err_path = cfg_path.with_suffix(".err")
+        err_file = open(err_path, "w", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(
+                [self._bin_path, "run", "-c", str(cfg_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=err_file,
+                **hide_console_kwargs(),
+            )
+        except OSError:
+            err_file.close()
+            try:
+                err_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                cfg_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        self._pool_err_file = err_file
+        self._pool_err_path = err_path
         return proc, cfg_path
 
     def _kill_process(self) -> None:
+        tail = self._xray_error_tail()
+        if tail:
+            self._last_xray_stderr = tail
         if self._pool_process is not None and self._pool_process.poll() is None:
             kill_process_tree(self._pool_process)
         self._pool_process = None
+        err_file = self._pool_err_file
+        self._pool_err_file = None
+        if err_file is not None:
+            try:
+                err_file.close()
+            except Exception:
+                pass
         if self._pool_cfg_path is not None:
             try:
                 self._pool_cfg_path.unlink(missing_ok=True)
             except OSError:
                 pass
             self._pool_cfg_path = None
+        err_path = self._pool_err_path
+        self._pool_err_path = None
+        if err_path is not None:
+            try:
+                extra = err_path.read_text(encoding="utf-8", errors="replace").strip()
+                if extra:
+                    self._last_xray_stderr = " ".join(extra.split())[-1500:]
+            except OSError:
+                pass
+            try:
+                err_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _cleanup_all(self) -> None:
         control = self._control
@@ -669,7 +889,9 @@ class ProxyPoolRunner:
             try:
                 loop = asyncio.new_event_loop()
                 try:
-                    loop.run_until_complete(control.close())
+                    loop.run_until_complete(
+                        asyncio.wait_for(control.close(), timeout=1.5)
+                    )
                 finally:
                     loop.close()
             except Exception:

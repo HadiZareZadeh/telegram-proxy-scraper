@@ -326,8 +326,9 @@ class App:
         ttk.Label(
             parent,
             text=(
-                "Run local SOCKS5 + HTTP slots from one never-restarted Xray. "
-                "SOCKS 10801+ and HTTP 11201+ stay bound; Rotate all flips balancer "
+                "Run local SOCKS5 + HTTP slots from one Xray process. "
+                "If Xray exits, the pool re-runs it and reassigns slots. "
+                "SOCKS/HTTP ports stay bound across rotate; Rotate all flips balancer "
                 "targets only (existing TCP sessions do not migrate). "
                 "Failed slots are repaired from the standby ring automatically."
             ),
